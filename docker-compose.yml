@@ -52,6 +52,47 @@ services:
     networks:
       - deeptutor-network
 
+  # ============================================
+  # Platform — Provider API + MCP + Mastery + Reports
+  # ============================================
+  platform:
+    build:
+      context: .
+      dockerfile: docker/platform/Dockerfile
+    container_name: platform
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    environment:
+      - PROVIDER_API_PORT=8100
+      - DEEPTUTOR_API_URL=http://deeptutor:8001
+      - DEEPTUTOR_URL=http://deeptutor:8001
+      - MASTERY_DIR=/data/mastery
+      - CHROMA_PERSIST_DIR=/data/chromadb
+      - INGEST_STATUS_DIR=/data/ingest_status
+      - UPLOADS_DIR=/data/uploads
+      - SOURCES_DIR=/data/sources
+      - SESSION_CLEANUP_THRESHOLD=2000
+      - CRON_INTERVAL_S=60
+      - QUIZ_SYNC_INTERVAL_S=60
+    volumes:
+      - ./data/mastery:/data/mastery
+      - ./data/chromadb:/data/chromadb
+      - ./data/ingest_status:/data/ingest_status
+      - ./data/uploads:/data/uploads
+      - ./data/sources:/data/sources
+    depends_on:
+      deeptutor:
+        condition: service_started
+    networks:
+      - deeptutor-network
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8100/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
 # ============================================
 # Networks
 # ============================================
