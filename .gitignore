@@ -13,6 +13,7 @@ deeptutor/agents/question/reference_papers/
 deeptutor/services/rag/eg_only_for_analysis/
 docs/
 .claude
+.deepseek/
 
 # LaTeX build artifacts
 *.aux
@@ -288,3 +289,35 @@ celerybeat.pid
 *.wav
 *.ogg
 !demo/*.mp4
+
+# ============================================
+# Scratch / Temp / Dev files (project-local)
+# ============================================
+# Dev runtime data (not to be confused with data/ above)
+data_dev/
+patches/
+test_data/
+tutor_platform_restored/
+
+# Temporary docs and planning artifacts
+PLAN.md
+DYNAMIC_RAG_PROVIDER.md
+RAG_PLUGIN_INTEGRATION_COMPLETE.md
+
+# One-off debug / diagnostic scripts
+_check_state.py
+_sched_dump.txt
+_tmp_ingest.txt
+_s2.txt
+_test.txt
+*deepseekscriptstest_result.txt
+scripts/check_patch_in_pyc.py
+scripts/diag_bytecode.py
+scripts/find_xiayiti.py
+scripts/test_teaching_chain.py
+
+# Stray files
+docker/platform/=1.6.0
+
+# Embedded git repos (model weights — manage via git submodule instead)
+vendor/DeepSeek-R1-Distill-Qwen-1.5B_RKLLM/
