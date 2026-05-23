@@ -9,10 +9,11 @@ def test_prompt_manager_loads_prompts_from_deeptutor_tree() -> None:
     manager = get_prompt_manager()
     manager.clear_cache()
 
+    # v1.4.0-beta refactored question agents; idea_agent was merged into pipeline
     prompts = manager.load_prompts(
         module_name="question",
-        agent_name="idea_agent",
+        agent_name="pipeline",
         language="en",
     )
 
-    assert "generate_ideas" in prompts
+    assert "labels" in prompts

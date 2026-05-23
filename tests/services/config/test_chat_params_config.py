@@ -41,8 +41,8 @@ class TestGetChatParams:
         params = get_chat_params()
         assert params["temperature"] == DEFAULT_CHAT_PARAMS["temperature"]
         assert params["max_iterations"] == 20
-        assert params["responding"]["max_tokens"] == 8000
-        assert params["answer_now"]["max_tokens"] == 8000
+        assert params["responding"]["max_tokens"] == 8192
+        assert params["answer_now"]["max_tokens"] == 8192
 
     def test_overrides_specific_stage_only(self, tmp_path: Path, monkeypatch):
         project_root = _write_agents_yaml(
@@ -58,8 +58,8 @@ class TestGetChatParams:
         monkeypatch.setattr(loader_module, "PROJECT_ROOT", project_root)
         params = get_chat_params()
         assert params["responding"]["max_tokens"] == 12000
-        assert params["answer_now"]["max_tokens"] == 8000
-        assert params["temperature"] == 0.2
+        assert params["answer_now"]["max_tokens"] == 8192
+        assert params["temperature"] == 0.5
         assert params["max_iterations"] == 20
 
     def test_overrides_temperature(self, tmp_path: Path, monkeypatch):
@@ -73,7 +73,7 @@ class TestGetChatParams:
         params = get_chat_params()
         assert params["temperature"] == 0.7
         assert params["max_iterations"] == 20
-        assert params["responding"]["max_tokens"] == 8000
+        assert params["responding"]["max_tokens"] == 8192
 
     def test_overrides_max_iterations(self, tmp_path: Path, monkeypatch):
         project_root = _write_agents_yaml(
@@ -85,7 +85,7 @@ class TestGetChatParams:
         monkeypatch.setattr(loader_module, "PROJECT_ROOT", project_root)
         params = get_chat_params()
         assert params["max_iterations"] == 12
-        assert params["responding"]["max_tokens"] == 8000
+        assert params["responding"]["max_tokens"] == 8192
 
     def test_full_chat_block_round_trip(self, tmp_path: Path, monkeypatch):
         project_root = _write_agents_yaml(
@@ -131,7 +131,7 @@ class TestGetChatParams:
         monkeypatch.setattr(loader_module, "PROJECT_ROOT", project_root)
         params = get_chat_params()
         assert params["responding"]["max_tokens"] == 9000
-        assert params["answer_now"]["max_tokens"] == 8000
+        assert params["answer_now"]["max_tokens"] == 8192
 
 
 class TestReadIntHelper:

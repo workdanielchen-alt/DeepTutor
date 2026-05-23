@@ -1,0 +1,193 @@
+# HermesAgent 子网关配置 — 孩子微信机器人 (v7.1)
+#
+# 与父网关共享同一组 MCP Server / Provider / 调度策略，
+# 但仅运行孩子微信机器人（无 API Server，无设备管理权限）。
+#
+# 容器内路径: /opt/data/child/config.yaml (通过 HERMES_HOME 加载)
+
+# ── Agent 配置 ──────────────────────────────────────────
+agent:
+  max_turns: 40
+  gateway_timeout: 120
+  gateway_timeout_warning: 90
+  api_max_retries: 1          # 本地模型失败一次立即降级云端，不多次重试
+  system_prompt: |
+    你是一位 AI 学习伙伴，通过微信陪伴 K9 学生学习和日常聊天。
+
+    ## 工作流程
+
+    收到消息后，先判断用户意图，然后按以下规则执行：
+
+    ### 学习意图 → 调工具转发给 DeepTutor
+
+    如果用户在做题、问知识点、解题、对答案、问"为什么"等，属于**学习意图**：
+    - **做题/对答案** → `mcp_deeptutor_tutor_chat(message=用户消息, learner_id=..., mode="guide")`，直接转发 DeepTutor 返回结果
+    - **问具体题目** → `mcp_deeptutor_tutor_chat(message=用户消息 + 题目内容, learner_id=..., mode="guide")`，用 tutor_chat 引导教学，不要用 deep_solve
+    - **查知识点** → `mcp_deeptutor_kb_search(query=..., learner_id=...)`
+    - **做练习题** → 先 `mcp_deeptutor_quiz_review(learner_id=...)` 查错题，再 `mcp_deeptutor_generate_practice(learner_id=...)` 出题
+    - **查学习记录** → `mcp_deeptutor_question_notebook_list(learner_id=...)`
+
+    ### ⚠️ 严禁直接答题
+
+    消息里如果包含 `[试卷内容]` 或 `[图片已自动识别` 等系统标记，说明这是系统自动提取的试卷/学习内容：
+
+    - **绝对不要**自己分析或解答这些内容
+    - **必须**调用 `mcp_deeptutor_tutor_chat` 转发给 DeepTutor 教学引擎
+    - DeepTutor 教学引擎会以引导式教学（不直接给答案）的方式帮助学生
+    - 你的职责是转发，不是解答`
+
+    ### 聊天意图 → 直接回复
+
+    如果用户在打招呼、聊日常、分享生活等，属于**聊天意图**：亲切自然地回复即可。
+
+    ### 规则
+
+    - 图片/文件已由系统自动处理，你不需要调用文件工具
+    - 所有工具调用传 learner_id，不知道用 "child1"
+    - 设备相关问题 → "这个需要找家长哦"
+    - 公式用 Unicode 数学符号 (α β γ ∫ √ ∞) 替代 LaTeX
+    - 单条消息不超过 2048 字符
+
+    收到图片或文件时系统已自动识别处理，你不需要调用文件处理工具。
+
+    ## 工具使用
+
+    - 所有工具调用传 learner_id，不知道名字用 "child1"
+    - 设备相关问题 → "这个需要找家长哦"，绝对不要尝试调用设备工具
+
+    ## 微信格式
+
+    - 公式用 Unicode 数学符号 (α β γ ∫ √ ∞) 替代 LaTeX
+    - 单条消息不超过 2048 字符
+    - 图片/文件已由系统自动处理
+
+# ── 推理模型 ──
+model:
+  default: deepseek-v4-flash
+  provider: deepseek
+  context_length: 64000
+
+# ── 云端降级链 — 本地失败或超时时走 DeepSeek API ──
+fallback_providers:
+  - provider: deepseek
+    model: deepseek-v4-flash
+
+# ── 模型提供商 ──
+providers:
+  rkllama:
+    provider: openai_compatible
+    base_url: http://rkllama:8080/v1
+    api_key: "not-needed"
+    models:
+      - r1-distill-1.5b
+      - qwen3-vl-2b
+      - deepseekocr-3b
+
+  deepseek:
+    provider: deepseek
+    api_key: ${DEEPSEEK_API_KEY}
+    models:
+      - deepseek-v4-flash
+      - deepseek-reasoner
+
+# ── 调度策略 ──
+scheduling:
+  ocr_timeout_s: 30
+  vision_timeout_s: 45
+
+# ── 辅助模型 ──
+auxiliary:
+  vision:
+    provider: rkllama
+    base_url: http://rkllama:8080/v1
+    model: qwen3-vl-2b
+    timeout: 90
+    temperature: 0.1
+  vision_fallback:
+    provider: deepseek
+    model: deepseek-vl
+    timeout: 120
+    temperature: 0.1
+
+  curator:
+    provider: deepseek
+    model: deepseek-v4-flash
+    timeout: 300
+
+  compression:
+    context_length: 64000
+
+# ── 技能系统 (v7.2) ────────────────────────────────────
+skills:
+  creation_nudge_interval: 15
+
+curator:
+  enabled: true
+  interval_hours: 336
+  min_idle_hours: 4
+
+# ── 语音 ──
+stt:
+  enabled: true
+  provider: local
+  local:
+    model: base
+    language: zh
+
+# ── 显示 ──
+display:
+  busy_input_mode: interrupt
+  busy_ack_enabled: false
+
+# ── 平台 (仅微信 — 无 API Server) ──
+platforms:
+  weixin:
+    enabled: true
+    extra:
+      base_url: https://ilinkai.weixin.qq.com
+      dm_policy: "open"
+      group_policy: "disabled"
+
+# ── 平台工具集 ──
+platform_toolsets:
+  weixin:
+    - hermes-weixin
+    - mcp-deeptutor
+
+# ── MCP Server 连接 ──
+mcp_servers:
+  deeptutor:
+    url: http://platform:8100/mcp
+    transport: streamableHttp
+    timeout: 120
+    tools:
+      include:
+      - kb_search
+      - kb_list
+      - kb_upload_text
+      - kb_upload_file
+      - quiz_review
+      - generate_practice
+      - tutor_chat
+      - book_create
+      - book_read
+      - book_list
+      - get_memory
+      - update_memory
+      - record_quiz_result
+      - question_notebook_list
+      - notebook_create
+      - notebook_read
+      - notebook_add_cell
+      - notebook_execute
+      - notebook_list
+      - set_scene
+      - detect_scene
+      - get_scene
+      - deep_solve
+      - vision_solve
+      - session_read
+      - view_source
+      - cowriter_edit
+      - cowriter_documents
+      - cowriter_history

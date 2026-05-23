@@ -37,7 +37,7 @@ async def test_incremental_add_migrates_matching_legacy_index_to_flat_version(
     legacy_storage_dir.mkdir(parents=True)
     (legacy_storage_dir / "docstore.json").write_text("{}", encoding="utf-8")
     (legacy_version_dir / "meta.json").write_text(
-        json.dumps({"signature": sig.hash(), "version": sig.hash()}),
+        json.dumps({"signature": sig.hash(), "version": sig.hash(), "storage_path": str(legacy_storage_dir)}),
         encoding="utf-8",
     )
 

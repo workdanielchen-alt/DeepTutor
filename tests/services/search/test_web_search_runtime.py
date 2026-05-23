@@ -58,7 +58,7 @@ def test_web_search_perplexity_missing_key_hard_fails(monkeypatch) -> None:
         ),
     )
     monkeypatch.setattr("deeptutor.services.search._resolve_provider_key", lambda _p, _k: "")
-    with pytest.raises(ValueError, match="perplexity requires api_key"):
+    with pytest.raises(ValueError, match="perplexity requires profile.api_key"):
         web_search("hello")
 
 

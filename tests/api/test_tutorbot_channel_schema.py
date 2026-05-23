@@ -11,6 +11,8 @@ Covers:
 
 from __future__ import annotations
 
+import importlib
+
 from fastapi.testclient import TestClient
 import pytest
 
@@ -23,21 +25,28 @@ from deeptutor.api.routers._tutorbot_channel_schema import (
 )
 
 
+def _available(name: str) -> bool:
+    """Check if an optional channel SDK is installed."""
+    return importlib.util.find_spec(name) is not None
+
+
 class TestResolveConfigModel:
+    def test_discord_pairs_with_discord_config(self) -> None:
+        from deeptutor.tutorbot.channels.discord import DiscordChannel, DiscordConfig
+
+        assert resolve_config_model(DiscordChannel) is DiscordConfig
+
+    @pytest.mark.skipif(not _available("telegram"), reason="telegram SDK not installed")
     def test_telegram_pairs_with_telegram_config(self) -> None:
         from deeptutor.tutorbot.channels.telegram import TelegramChannel, TelegramConfig
 
         assert resolve_config_model(TelegramChannel) is TelegramConfig
 
+    @pytest.mark.skipif(not _available("slack_sdk"), reason="slack_sdk not installed")
     def test_slack_pairs_with_slack_config(self) -> None:
         from deeptutor.tutorbot.channels.slack import SlackChannel, SlackConfig
 
         assert resolve_config_model(SlackChannel) is SlackConfig
-
-    def test_discord_pairs_with_discord_config(self) -> None:
-        from deeptutor.tutorbot.channels.discord import DiscordChannel, DiscordConfig
-
-        assert resolve_config_model(DiscordChannel) is DiscordConfig
 
 
 class TestInlineRefs:
@@ -115,6 +124,7 @@ class TestCollectSecretFields:
 
 
 class TestChannelSchemaPayload:
+    @pytest.mark.skipif(not _available("telegram"), reason="telegram SDK not installed")
     def test_telegram_payload_shape(self) -> None:
         from deeptutor.tutorbot.channels.telegram import TelegramChannel
 
@@ -128,6 +138,7 @@ class TestChannelSchemaPayload:
         assert "allow_from" in props and "allowFrom" not in props
         assert payload["default_config"]["enabled"] is False
 
+    @pytest.mark.skipif(not _available("slack_sdk"), reason="slack_sdk not installed")
     def test_slack_dm_subtree_inlined(self) -> None:
         from deeptutor.tutorbot.channels.slack import SlackChannel
 
@@ -160,14 +171,15 @@ class TestEndpoint:
         assert res.status_code == 200
         body = res.json()
         assert set(body.keys()) >= {"channels", "global"}
-        # Telegram is always installed (no extra deps).
-        assert "telegram" in body["channels"]
+        # At least one channel is always registered (discord is built-in)
+        assert len(body["channels"]) > 0
+        assert "discord" in body["channels"]
 
-    def test_telegram_entry_has_secret_fields(self, client: TestClient) -> None:
+    def test_discord_entry_has_secret_fields(self, client: TestClient) -> None:
         res = client.get("/api/v1/tutorbot/channels/schema")
-        tg = res.json()["channels"]["telegram"]
-        assert tg["secret_fields"] == ["token"]
-        assert "token" in tg["json_schema"]["properties"]
+        dc = res.json()["channels"]["discord"]
+        assert "token" in dc["secret_fields"]
+        assert "token" in dc["json_schema"]["properties"]
 
     def test_global_schema_uses_snake_case(self, client: TestClient) -> None:
         res = client.get("/api/v1/tutorbot/channels/schema")
@@ -177,9 +189,9 @@ class TestEndpoint:
 
 
 class TestAllChannelSchemas:
-    def test_returns_at_least_telegram(self) -> None:
+    def test_returns_at_least_discord(self) -> None:
         out = all_channel_schemas()
-        assert "telegram" in out
+        assert "discord" in out
         # Every payload has the four documented keys.
         for entry in out.values():
             assert {

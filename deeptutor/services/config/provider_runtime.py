@@ -128,6 +128,15 @@ EMBEDDING_PROVIDERS: dict[str, EmbeddingProviderSpec] = {
         keywords=("vllm", "lmstudio"),
         is_local=True,
     ),
+    "rkllama": EmbeddingProviderSpec(
+        label="RKLLM Local",
+        mode="local",
+        default_api_base="",
+        keywords=("rkllama", "rkllm", "bge-small-zh"),
+        is_local=True,
+        default_model="bge-small-zh",
+        default_dim=384,
+    ),
     "siliconflow": EmbeddingProviderSpec(
         label="SiliconFlow",
         adapter="openai_compat",

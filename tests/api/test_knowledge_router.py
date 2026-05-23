@@ -337,6 +337,11 @@ def test_reindex_accepts_default_alias(monkeypatch, tmp_path: Path) -> None:
 
     embedding_signature = importlib.import_module("deeptutor.services.rag.embedding_signature")
     index_versioning = importlib.import_module("deeptutor.services.rag.index_versioning")
+    # Pre-import storage so it captures the original find_matching_version,
+    # not the monkeypatched one — otherwise the import inside
+    # _matching_index_is_valid permanently binds the patched lambda to
+    # storage.find_matching_version.
+    importlib.import_module("deeptutor.services.rag.pipelines.llamaindex.storage")
     monkeypatch.setattr(
         embedding_signature, "signature_from_embedding_config", lambda: _Signature()
     )
@@ -373,6 +378,9 @@ def test_reindex_error_status_bypasses_existing_match_noop(monkeypatch, tmp_path
 
     embedding_signature = importlib.import_module("deeptutor.services.rag.embedding_signature")
     index_versioning = importlib.import_module("deeptutor.services.rag.index_versioning")
+    # Pre-import storage so it captures the original find_matching_version,
+    # not the monkeypatched lambda (see test_reindex_accepts_default_alias).
+    importlib.import_module("deeptutor.services.rag.pipelines.llamaindex.storage")
     monkeypatch.setattr(
         embedding_signature, "signature_from_embedding_config", lambda: _Signature()
     )

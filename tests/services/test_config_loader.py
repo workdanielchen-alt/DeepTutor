@@ -53,4 +53,7 @@ def test_load_config_with_main_uses_explicit_project_root() -> None:
     config = load_config_with_main("main.yaml", PROJECT_ROOT)
 
     assert "system" in config
-    assert config["paths"]["solve_output_dir"].endswith("data/user/workspace/chat/deep_solve")
+    solve_dir = config["paths"]["solve_output_dir"]
+    assert solve_dir.endswith("data/user/workspace/chat/deep_solve") or solve_dir.endswith(
+        "data\\user\\workspace\\chat\\deep_solve"
+    )

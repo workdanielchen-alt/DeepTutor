@@ -4,7 +4,7 @@ import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 
 /**
- * Root page now redirects to /chat.
+ * Root page now redirects to /space/learning (learning dashboard).
  * Handles backward compatibility for /?session=xxx URLs.
  */
 export default function HomePage() {
@@ -13,17 +13,12 @@ export default function HomePage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const sessionId = params.get("session");
-    const capability = params.get("capability");
-    const tools = params.getAll("tool");
 
-    let target = sessionId ? `/chat/${sessionId}` : "/chat";
-
-    const query: string[] = [];
-    if (capability) query.push(`capability=${encodeURIComponent(capability)}`);
-    tools.forEach((t) => query.push(`tool=${encodeURIComponent(t)}`));
-    if (query.length) target += `?${query.join("&")}`;
-
-    router.replace(target);
+    if (sessionId) {
+      router.replace(`/chat/${sessionId}`);
+    } else {
+      router.replace("/space/learning");
+    }
   }, [router]);
 
   return null;

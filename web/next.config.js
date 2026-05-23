@@ -75,6 +75,14 @@ const APP_VERSION = (() => {
   return "";
 })();
 
+// Platform API service URL (used by rewrites proxy).
+// Defaults to localhost:8100 for local dev. In Docker Compose, set
+// PLATFORM_URL=http://platform:8100 via docker-compose.yml env.
+const PLATFORM_URL = firstNonEmpty(
+  process.env.PLATFORM_URL,
+  "http://localhost:8100",
+);
+
 const nextConfig = {
   // Expose the build-time version to the browser so the sidebar badge
   // can compare it against GitHub's latest release.
@@ -109,12 +117,26 @@ const nextConfig = {
     const path = require("path");
     config.resolve.alias = {
       ...config.resolve.alias,
+      "@": path.resolve(__dirname),
       cytoscape: path.resolve(
         __dirname,
         "node_modules/cytoscape/dist/cytoscape.cjs.js",
       ),
     };
     return config;
+  },
+
+  // Rewrites: proxy /api/platform/* → platform API.
+  // The web frontend cannot call the platform container directly from
+  // the browser.  Next.js server-side rewrites bridge the gap so
+  // requests land on the same origin.
+  async rewrites() {
+    return [
+      {
+        source: "/api/platform/:path*",
+        destination: `${PLATFORM_URL}/api/:path*`,
+      },
+    ];
   },
 };
 

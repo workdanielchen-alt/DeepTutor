@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import sqlite3
+import time
 
 import pytest
 
@@ -38,9 +39,18 @@ def test_sqlite_store_migrates_legacy_chat_history_db(tmp_path: Path) -> None:
         service._user_data_dir = tmp_path / "data" / "user"
         legacy_db = tmp_path / "data" / "chat_history.db"
         legacy_db.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(legacy_db) as conn:
+        conn = sqlite3.connect(str(legacy_db))
+        try:
             conn.execute("CREATE TABLE legacy (id INTEGER PRIMARY KEY)")
             conn.commit()
+        finally:
+            conn.close()
+        # On Windows, SQLite may hold a file lock after close; wait and
+        # clean up any WAL / SHM artifacts so os.replace() succeeds.
+        time.sleep(0)
+        for _extra in [legacy_db.with_suffix(".db-wal"), legacy_db.with_suffix(".db-shm")]:
+            if _extra.exists():
+                _extra.unlink()
 
         store = SQLiteSessionStore()
 

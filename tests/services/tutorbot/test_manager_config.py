@@ -15,15 +15,21 @@ from deeptutor.services.tutorbot.model_runtime import resolve_tutorbot_llm_confi
 
 
 @pytest.fixture
-def manager(tmp_path: Path) -> TutorBotManager:
+def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TutorBotManager:
     """Return a TutorBotManager whose data dir is a fresh temp directory."""
-    mgr = TutorBotManager()
-    # Replace the path service with a stub so reads/writes stay sandboxed.
-    mgr._path_service = SimpleNamespace(  # type: ignore[assignment]
+    # _path_service is now a read-only property backed by get_path_service();
+    # monkeypatch the global service to keep all I/O sandboxed.
+    fake = SimpleNamespace(
         project_root=tmp_path,
+        workspace_root=tmp_path,
+        user_data_dir=tmp_path / "data" / "user",
         get_memory_dir=lambda: tmp_path / "memory",
     )
-    return mgr
+    monkeypatch.setattr(
+        "deeptutor.services.tutorbot.manager.get_path_service",
+        lambda: fake,
+    )
+    return TutorBotManager()
 
 
 def _append_session_line(manager: TutorBotManager, bot_id: str, payload: dict) -> None:

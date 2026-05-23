@@ -6,16 +6,23 @@ from pathlib import Path
 import sys
 from unittest import mock
 
+import pytest
+
+_CLI_KIT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "_cli_kit.py"
+
 
 def _load_cli_kit():
-    module_path = Path(__file__).resolve().parents[2] / "scripts" / "_cli_kit.py"
-    spec = importlib.util.spec_from_file_location("cli_kit_under_test", module_path)
+    spec = importlib.util.spec_from_file_location("cli_kit_under_test", _CLI_KIT_PATH)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
+@pytest.mark.skipif(
+    not _CLI_KIT_PATH.exists(),
+    reason="_cli_kit.py is generated at build time, not present in source tree",
+)
 def test_log_helpers_do_not_raise_on_legacy_windows_code_page() -> None:
     buffer = io.BytesIO()
     stdout = io.TextIOWrapper(buffer, encoding="cp936", errors="strict")

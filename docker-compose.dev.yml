@@ -10,13 +10,45 @@
 # ============================================
 
 services:
-  pocketbase:
-    volumes:
-      - ./data/pocketbase:/pb/pb_data
+  # ============================================
+  # rkllama — 本地 LLM (RK3576 NPU 版, stub on PC)
+  # ============================================
+  rkllama:
+    image: deepseek-rkllama:latest
+    container_name: rkllama
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - RKLLM_PORT=8080
+      - RKLLM_LOG_LEVEL=0
+      - RKLLM_MAX_MEM_MB=3500
+      - RKLLM_STUB_MODE=true
+      # disable stub on real RK3576: RKLLM_STUB_MODE=false
+    working_dir: /app
+    command: python rkllama_server.py
+    shm_size: 256m
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    networks:
+      - deeptutor-network
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   deeptutor:
     build:
       target: development
+
+    deploy:
+      resources:
+        limits:
+          memory: 2G
 
     volumes:
       # Mount backend source code for hot-reload
@@ -49,3 +81,121 @@ services:
 
     networks:
       - deeptutor-network
+
+  # ============================================
+  # Hermes Agent — WeChat iLink dual-bot gateway
+  # ============================================
+  hermes_agent:
+    image: deepseek-hermes_agent:latest
+    container_name: hermes_agent
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      - WEIXIN_TOKEN=${WEIXIN_TOKEN}
+      - WEIXIN_ACCOUNT_ID=${WEIXIN_ACCOUNT_ID}
+      - WEIXIN_HOME_CHANNEL=o9cq802ba7xQQlXcT8l93_xO0jN0@im.wechat
+      - WEIXIN_DM_POLICY=open
+      - WEIXIN_GROUP_POLICY=disabled
+      - WEIXIN_ALLOWED_USERS=
+      - GATEWAY_ALLOW_ALL_USERS=true
+      - CHILD_WEIXIN_TOKEN=${CHILD_WEIXIN_TOKEN}
+      - CHILD_WEIXIN_ACCOUNT_ID=9fd8e4a28c1d@im.bot
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_PORT=8004
+      - API_SERVER_KEY=deepseek-local-key
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-8cfebec23e774bdab1020bbdce061fce}
+      - HERMES_AGENT_TIMEOUT=120
+      - HERMES_API_TIMEOUT=30
+      - HERMES_OPENAI_TIMEOUT=90
+      - HERMES_HOME=/opt/data
+    volumes:
+      - ./data_dev/hermes:/opt/data:rw
+      - ./data_dev/hermes_child:/opt/data/child:rw
+      - ./config/hermes_config.yaml:/opt/data/config.yaml:ro
+      - ./config/hermes_child_config.yaml:/opt/hermes/child/config.yaml:ro
+      - ./vendor/hermes-agent/run_agent.py:/opt/hermes/run_agent.py:ro
+      - ./vendor/hermes-agent/gateway/platforms/weixin.py:/opt/hermes/gateway/platforms/weixin.py:ro
+      - ./docker/platform/gateway_start.sh:/opt/hermes/docker/gateway_start.sh:ro
+      - ./docker/platform/patches/gateway_run.py:/opt/hermes/gateway/run.py:ro
+    command: bash /opt/hermes/docker/gateway_start.sh
+    depends_on:
+      rkllama:
+        condition: service_healthy
+    networks:
+      - deeptutor-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ============================================
+  # Platform — Provider API + MCP + Cron + Device Manager
+  # ============================================
+  platform:
+    image: deepseek-platform:latest
+    container_name: platform
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+      - "8101:8101"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    environment:
+      - PROVIDER_API_PORT=8100
+      - DEVICE_MANAGER_PORT=8101
+      - DEEPTUTOR_API_URL=http://deeptutor:8001
+      - DEEPTUTOR_URL=http://deeptutor:8001
+      - HERMES_AGENT_URL=http://hermes_agent:8004
+      - OLLAMA_URL=http://ollama:11434
+      - RKLLM_SERVER_URL=http://rkllama:8080
+      - MASTERY_DIR=/data/mastery
+      - CHROMA_PERSIST_DIR=/data/chromadb
+      - INGEST_STATUS_DIR=/data/ingest_status
+      - UPLOADS_DIR=/data/uploads
+      - SOURCES_DIR=/data/sources
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - SESSION_CLEANUP_THRESHOLD=2000
+      - RKLLM_STUB_MODE=true
+      - CRON_INTERVAL_S=60
+      - QUIZ_SYNC_INTERVAL_S=60
+    volumes:
+      # 挂载重建的 tutor_platform 和 domains 模块
+      - ./tutor_platform:/tutor_platform:ro
+      - ./domains:/domains:ro
+      # 挂载 provider API 和 MCP server 源码 (容器内 /app 目录)
+      - ./docker/platform/provider_api.py:/app/provider_api.py:ro
+      - ./docker/platform/mcp_server.py:/app/mcp_server.py:ro
+      # 持久化数据目录
+      - ./data/mastery:/data/mastery
+      - ./data/chromadb:/data/chromadb
+      - ./data/ingest_status:/data/ingest_status
+      - ./data/uploads:/data/uploads
+      - ./data/sources:/data/sources
+      # 共享 hermes_agent 数据卷 (路径翻译: /opt/data/ → /data/hermes/)
+      - ./data_dev/hermes:/data/hermes
+      - ./data_dev/hermes_child:/data/hermes_child
+    depends_on:
+      rkllama:
+        condition: service_healthy
+      deeptutor:
+        condition: service_started
+      hermes_agent:
+        condition: service_started
+    networks:
+      - deeptutor-network
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8100/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

@@ -53,7 +53,10 @@ class MathAnimatorCapability(BaseCapability):
         from deeptutor.services.llm.config import get_llm_config
 
         llm_config = get_llm_config()
-        request_config = validate_math_animator_request_config(context.config_overrides)
+        # Strip internal keys that are not part of the MathAnimatorRequestConfig.
+        _raw = (context.config_overrides or {}).copy()
+        _raw.pop("answer_now_context", None)
+        request_config = validate_math_animator_request_config(_raw)
         usage = UsageTracker(model=getattr(llm_config, "model", None))
         i18n = StatusI18n(self.name, context.language)
         pipeline = MathAnimatorPipeline(
