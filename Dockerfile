@@ -39,14 +39,20 @@ COPY web/ ./
 # can read it during ``npm run build`` and inline it into the bundle.
 COPY deeptutor/__version__.py /app/deeptutor/__version__.py
 
-# Create .env.local with placeholders that will be replaced at runtime.
+# Build-time env vars — passed as build args from docker-compose.yml
+# or use the defaults below for standalone builds (docker build --no-build-arg).
+ARG PLATFORM_URL
+ARG NEXT_PUBLIC_API_BASE=http://localhost:8001
+ARG NEXT_PUBLIC_AUTH_ENABLED=false
+
+# Create .env.local so Next.js bakes these values into the production
+# bundles at build time — no runtime sed replacement needed.
 RUN printf '%s\n' \
-    'NEXT_PUBLIC_API_BASE=__NEXT_PUBLIC_API_BASE_PLACEHOLDER__' \
-    'NEXT_PUBLIC_AUTH_ENABLED=__NEXT_PUBLIC_AUTH_ENABLED_PLACEHOLDER__' \
+    "NEXT_PUBLIC_API_BASE=${NEXT_PUBLIC_API_BASE}" \
+    "NEXT_PUBLIC_AUTH_ENABLED=${NEXT_PUBLIC_AUTH_ENABLED}" \
     > .env.local
 
 # Build Next.js for production with standalone output
-# This allows runtime environment variable injection
 RUN npm run build
 
 # ============================================
@@ -261,21 +267,6 @@ else
 fi
 
 echo "[Frontend] 🚀 Starting Next.js frontend on port ${FRONTEND_PORT}..."
-
-# Replace placeholder in built Next.js files
-# This is necessary because NEXT_PUBLIC_* vars are inlined at build time
-escape_sed_replacement() {
-    printf '%s' "$1" | sed -e 's/[|\/&]/\\&/g'
-}
-
-API_BASE_ESCAPED="$(escape_sed_replacement "$API_BASE")"
-AUTH_ENABLED_ESCAPED="$(escape_sed_replacement "$AUTH_ENABLED")"
-
-find /app/web/.next -type f \( -name "*.js" -o -name "*.json" \) -exec \
-    sed -i \
-        -e "s|__NEXT_PUBLIC_API_BASE_PLACEHOLDER__|${API_BASE_ESCAPED}|g" \
-        -e "s|__NEXT_PUBLIC_AUTH_ENABLED_PLACEHOLDER__|${AUTH_ENABLED_ESCAPED}|g" \
-        {} \; 2>/dev/null || true
 
 # Start Next.js standalone server
 # The standalone server reads PORT and HOSTNAME from environment variables

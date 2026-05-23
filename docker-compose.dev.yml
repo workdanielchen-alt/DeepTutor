@@ -66,6 +66,13 @@ services:
       - ./web/locales:/app/web/locales:ro
       - ./web/public:/app/web/public:ro
 
+      # Mount config files for hot-reload (tsconfig needs paths alias,
+      # tailwind/postcss for dev compilation, next.config for env changes)
+      - ./web/tsconfig.json:/app/web/tsconfig.json:ro
+      - ./web/tailwind.config.js:/app/web/tailwind.config.js:ro
+      - ./web/postcss.config.js:/app/web/postcss.config.js:ro
+      - ./web/next.config.js:/app/web/next.config.js:ro
+
       # Mount data directories (writable) - output to local ./data
       - ./data/user:/app/data/user
       - ./data/memory:/app/data/memory
@@ -152,6 +159,7 @@ services:
           memory: 1G
     environment:
       - PROVIDER_API_PORT=8100
+      - DEVICE_MANAGER_URL=http://localhost:8101
       - DEVICE_MANAGER_PORT=8101
       - DEEPTUTOR_API_URL=http://deeptutor:8001
       - DEEPTUTOR_URL=http://deeptutor:8001
@@ -168,6 +176,8 @@ services:
       - RKLLM_STUB_MODE=true
       - CRON_INTERVAL_S=60
       - QUIZ_SYNC_INTERVAL_S=60
+      - HERMES_CONTAINER=hermes_agent
+      - DEVICE_IP=127.0.0.1
     volumes:
       # 挂载重建的 tutor_platform 和 domains 模块
       - ./tutor_platform:/tutor_platform:ro
@@ -184,6 +194,8 @@ services:
       # 共享 hermes_agent 数据卷 (路径翻译: /opt/data/ → /data/hermes/)
       - ./data_dev/hermes:/data/hermes
       - ./data_dev/hermes_child:/data/hermes_child
+      # Docker socket: allow exec into hermes_agent for QR login operations
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     depends_on:
       rkllama:
         condition: service_healthy

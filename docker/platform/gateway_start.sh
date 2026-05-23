@@ -6,6 +6,13 @@ HERMES_HOME="${HERMES_HOME:-/opt/data}"
 PARENT_PID=""
 CHILD_PID=""
 
+# Ensure qr_login dependencies are available (apt packages survive container restart)
+# pyyaml + aiohttp needed by gateway.platforms.weixin.qr_login for Docker exec bootstrap
+python3 -c "import yaml, aiohttp" 2>/dev/null || {
+    echo "[gateway_start] Installing missing Python deps (yaml, aiohttp)..."
+    apt-get update -qq && apt-get install -y -qq python3-yaml python3-aiohttp 2>/dev/null
+}
+
 cleanup() {
     echo "[gateway_start] Shutting down..."
     [ -n "$PARENT_PID" ] && kill "$PARENT_PID" 2>/dev/null || true
@@ -36,6 +43,39 @@ for i in $(seq 1 5); do
     echo "[gateway_start] iLink server not reachable yet (attempt $i), retrying..."
     sleep 2
 done
+
+# Bootstrap identity fallback: if WEIXIN_TOKEN is empty, load from identity file
+# so the gateway picks up credentials created by qr_login during first-time setup.
+if [ -z "${WEIXIN_TOKEN}" ] && [ -f "${HERMES_HOME}/.parent_identity.json" ]; then
+    WEIXIN_TOKEN=$(python3 -c "
+import json
+try:
+    d = json.load(open('${HERMES_HOME}/.parent_identity.json'))
+    print(d.get('token', ''))
+except Exception:
+    print('')
+" 2>/dev/null)
+    if [ -n "${WEIXIN_TOKEN}" ]; then
+        export WEIXIN_TOKEN
+        echo "[gateway_start] Loaded parent identity from ${HERMES_HOME}/.parent_identity.json"
+    fi
+fi
+
+# Child identity fallback: load from identity file if env var is empty
+if [ -z "${CHILD_WEIXIN_TOKEN}" ] && [ -f "${HERMES_HOME}/child/.child_identity.json" ]; then
+    CHILD_WEIXIN_TOKEN=$(python3 -c "
+import json
+try:
+    d = json.load(open('${HERMES_HOME}/child/.child_identity.json'))
+    print(d.get('token', ''))
+except Exception:
+    print('')
+" 2>/dev/null)
+    if [ -n "${CHILD_WEIXIN_TOKEN}" ]; then
+        export CHILD_WEIXIN_TOKEN
+        echo "[gateway_start] Loaded child identity from ${HERMES_HOME}/child/.child_identity.json"
+    fi
+fi
 
 # Start parent gateway
 echo "[gateway_start] Starting parent gateway..."

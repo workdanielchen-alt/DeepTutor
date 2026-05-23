@@ -7,18 +7,19 @@ platform/mcp_server.py — MCP Server (v7.0, 从 deeptutor_mcp 合并)
   - 保留全部 33 个工具 + 熔断器 + fast/slow path
 """
 
-import os
-import json
-import base64
 import asyncio
-import time
-import logging
+import base64
 import contextvars
+import json
+import logging
+import os
+import time
+
 import httpx
 
 logger = logging.getLogger(__name__)
 from mcp.server.fastmcp import FastMCP
-from mcp.types import TextContent, ImageContent
+from mcp.types import ImageContent, TextContent
 
 DEEPTUTOR_URL = os.getenv("DEEPTUTOR_API_URL", "http://deeptutor:8003")
 PLATFORM_URL = os.getenv("PLATFORM_API_URL", "http://localhost:8100")
@@ -76,13 +77,24 @@ _scene: str = "full"
 # ── 角色权限门禁 (方案C: 单 HA + 身份门禁) ──
 # Layer 2 防御: 孩子无法调用设备管理工具
 _CHILD_BLOCKED_TOOLS: set[str] = {
-    "device_status", "device_temp", "storage_info", "ssd_health",
-    "wifi_scan", "wifi_configure", "wifi_status", "wifi_forget", "device_cleanup",
-    "device_command", "device_alerts",
-    "get_circuit_status", "reset_circuit", "get_bot_qrcode",
+    "device_status",
+    "device_temp",
+    "storage_info",
+    "ssd_health",
+    "wifi_scan",
+    "wifi_configure",
+    "wifi_status",
+    "wifi_forget",
+    "device_cleanup",
+    "device_command",
+    "device_alerts",
+    "get_circuit_status",
+    "reset_circuit",
+    "get_bot_qrcode",
 }
 
 _PARENT_ROLE = "parent"
+
 
 def _check_tool_permission(tool_name: str, learner_id: str = "") -> str | None:
     """检查工具调用权限. 返回 None=放行, 返回 str=拒绝原因."""
@@ -92,11 +104,13 @@ def _check_tool_permission(tool_name: str, learner_id: str = "") -> str | None:
         return None
     return f"需要家长权限才能使用 {tool_name}，请让家长来操作"
 
+
 def _check_device_permission(agent_role: str = "") -> str | None:
     """检查设备工具调用权限 (B 类工具, 无 learner_id 参数). v7.2: 大小写不敏感."""
     if agent_role.lower() == _PARENT_ROLE:
         return None
     return "需要家长权限才能管理设备，请让家长来操作"
+
 
 _SLOW_TOOLS: set[str] = {
     "process_file",
@@ -119,83 +133,160 @@ _slow_pending: int = 0
 _SLOW_BUSY_THRESHOLD: int = 5
 
 _SCENE_TOOLS: dict[str, set[str]] = {
-    "practice": {"quiz_review", "generate_practice", "generate_exam_paper", "deep_solve", "vision_solve",
-                  "record_quiz_result", "question_notebook_list"},
+    "practice": {
+        "quiz_review",
+        "generate_practice",
+        "generate_exam_paper",
+        "deep_solve",
+        "vision_solve",
+        "record_quiz_result",
+        "question_notebook_list",
+    },
     "reading": {"book_create", "book_read", "book_list"},
 }
 
 _TOOL_DESCRIPTIONS: dict[str, str] = {
-    "kb_search":           "知识库搜索",
-    "kb_list":             "列出知识库",
-    "kb_upload_text":      "文本入库",
-    "kb_upload_file":      "文件入库",
-    "quiz_review":         "错题回顾",
-    "generate_practice":   "根据错题生成针对性练习题",
+    "kb_search": "知识库搜索",
+    "kb_list": "列出知识库",
+    "kb_upload_text": "文本入库",
+    "kb_upload_file": "文件入库",
+    "quiz_review": "错题回顾",
+    "generate_practice": "根据错题生成针对性练习题",
     "generate_exam_paper": "根据学情生成完整强化训练试卷 — 覆盖全部薄弱知识点",
-    "deep_solve":          "深度解题 — 用户明确要求时调用, OCR自动内容用 tutor_chat",
-    "vision_solve":        "拍照解题 — 将题目图片发给解题引擎返回图文解答",
-    "update_memory":       "更新学习者画像 (summary/profile)",
-    "record_quiz_result":  "记录答题结果到学习会话",
+    "deep_solve": "深度解题 — 用户明确要求时调用, OCR自动内容用 tutor_chat",
+    "vision_solve": "拍照解题 — 将题目图片发给解题引擎返回图文解答",
+    "update_memory": "更新学习者画像 (summary/profile)",
+    "record_quiz_result": "记录答题结果到学习会话",
     "question_notebook_list": "查询学习历史中的所有答题记录（含纠错本）",
-    "generate_report":      "生成学习报告 (日报/周报/月报) — 返回报告文本",
-    "book_create":         "生成教材",
-    "book_read":           "阅读教材",
-    "book_list":           "列出教材",
-    "get_memory":          "学习者画像",
-    "process_file":        "文件处理 (归一化→OCR→意图→分发)",
-    "set_scene":           "场景切换",
-    "detect_scene":        "场景识别",
-    "get_circuit_status":  "熔断器状态",
-    "reset_circuit":       "重置熔断器",
-    "device_status":       "设备综合状态",
-    "storage_info":        "存储空间详情",
-    "view_source":         "查看原始资料（根据 trace_id 检索归档文件）",
-    "ssd_health":          "SSD 健康状态",
-    "device_temp":         "设备温度",
-    "wifi_scan":           "WiFi 扫描",
-    "device_command":      "设备管理统一入口：先规则匹配，未分类时 LLM 兜底",
-    "device_alerts":       "查询设备告警 (温度/存储/SSD/服务异常)",
-    "wifi_configure":      "WiFi 连接",
-    "wifi_forget":         "忘记已保存的 WiFi 网络",
-    "wifi_status":         "WiFi 状态",
-    "device_cleanup":      "安全清理旧日志和上传暂存文件",
-    "cowriter_edit":       "AI 协作文本编辑 (润色/缩短/扩展)",
-    "cowriter_documents":  "列出/创建 Co-Writer 文档",
-    "cowriter_history":    "Co-Writer 编辑历史",
-    "get_scene":           "场景状态和可用工具",
-    "notebook_create":     "创建交互式笔记",
-    "notebook_read":       "读取笔记内容",
-    "notebook_add_cell":   "添加单元格 (Markdown/代码)",
-    "notebook_execute":    "执行代码单元格",
-    "notebook_list":       "列出所有笔记",
-    "tutor_chat":          "引导式教学 (将消息转发给 DeepTutor 教学引擎)",
-    "session_read":        "读取 Web 端学习会话历史",
-    "get_bot_qrcode":      "警告: 仅家长可调用。当家长说【加孩子】或【加孩子学习】时，必须立即调用此工具生成二维码。",
-    "bind_child_bot":      "警告: 仅家长可调用，仅首次。当孩子没有专属机器人时调用此工具创建并返回二维码。已绑定请用 get_bot_qrcode。",
+    "generate_report": "生成学习报告 (日报/周报/月报) — 返回报告文本",
+    "book_create": "生成教材",
+    "book_read": "阅读教材",
+    "book_list": "列出教材",
+    "get_memory": "学习者画像",
+    "process_file": "文件处理 (归一化→OCR→意图→分发)",
+    "set_scene": "场景切换",
+    "detect_scene": "场景识别",
+    "get_circuit_status": "熔断器状态",
+    "reset_circuit": "重置熔断器",
+    "device_status": "设备综合状态",
+    "storage_info": "存储空间详情",
+    "view_source": "查看原始资料（根据 trace_id 检索归档文件）",
+    "ssd_health": "SSD 健康状态",
+    "device_temp": "设备温度",
+    "wifi_scan": "WiFi 扫描",
+    "device_command": "设备管理统一入口：先规则匹配，未分类时 LLM 兜底",
+    "device_alerts": "查询设备告警 (温度/存储/SSD/服务异常)",
+    "wifi_configure": "WiFi 连接",
+    "wifi_forget": "忘记已保存的 WiFi 网络",
+    "wifi_status": "WiFi 状态",
+    "device_cleanup": "安全清理旧日志和上传暂存文件",
+    "cowriter_edit": "AI 协作文本编辑 (润色/缩短/扩展)",
+    "cowriter_documents": "列出/创建 Co-Writer 文档",
+    "cowriter_history": "Co-Writer 编辑历史",
+    "get_scene": "场景状态和可用工具",
+    "notebook_create": "创建交互式笔记",
+    "notebook_read": "读取笔记内容",
+    "notebook_add_cell": "添加单元格 (Markdown/代码)",
+    "notebook_execute": "执行代码单元格",
+    "notebook_list": "列出所有笔记",
+    "tutor_chat": "引导式教学 (将消息转发给 DeepTutor 教学引擎)",
+    "session_read": "读取 Web 端学习会话历史",
+    "get_bot_qrcode": "警告: 仅家长可调用。当家长说【加孩子】或【加孩子学习】时，必须立即调用此工具生成二维码。",
+    "bind_child_bot": "警告: 仅家长可调用，仅首次。当孩子没有专属机器人时调用此工具创建并返回二维码。已绑定请用 get_bot_qrcode。",
 }
 
 _SCENE_KEYWORDS: dict[str, list[tuple[list[str], int]]] = {
     "practice": [
-        (["出题", "做题", "刷题", "练习题", "测验", "考试", "题目", "批改", "错题",
-          "解题", "求解", "答案", "对错", "步骤", "运算",
-          "因式分解", "解方程", "计算", "证明", "几何", "函数"], 2),
+        (
+            [
+                "出题",
+                "做题",
+                "刷题",
+                "练习题",
+                "测验",
+                "考试",
+                "题目",
+                "批改",
+                "错题",
+                "解题",
+                "求解",
+                "答案",
+                "对错",
+                "步骤",
+                "运算",
+                "因式分解",
+                "解方程",
+                "计算",
+                "证明",
+                "几何",
+                "函数",
+            ],
+            2,
+        ),
     ],
     "reading": [
-        (["教材", "课本", "阅读", "看书", "学习资料", "课程", "章节",
-          "可视化", "图表", "画图", "概念图", "思维导图",
-          "解释概念", "什么是", "讲解", "原理", "定义"], 2),
+        (
+            [
+                "教材",
+                "课本",
+                "阅读",
+                "看书",
+                "学习资料",
+                "课程",
+                "章节",
+                "可视化",
+                "图表",
+                "画图",
+                "概念图",
+                "思维导图",
+                "解释概念",
+                "什么是",
+                "讲解",
+                "原理",
+                "定义",
+            ],
+            2,
+        ),
     ],
 }
 
 _DEVICE_KEYWORDS: list[str] = [
-    "温度", "多少度", "烫", "散热", "发热",
-    "存储", "空间", "磁盘", "硬盘", "满了", "还剩",
-    "ssd", "寿命", "磨损", "固态",
-    "wifi", "wi-fi", "网络", "连网", "无线", "扫描wifi", "扫描网络", "搜wifi", "搜网络", "搜无线",
-    "设备状态", "系统状态", "运行状态",
-    "ip", "信号",
-    "清理", "释放", "腾空间",
-    "加孩子", "绑定孩子", "子网关",  # 子网关绑定 (规则优先, LLM 兜底)
+    "温度",
+    "多少度",
+    "烫",
+    "散热",
+    "发热",
+    "存储",
+    "空间",
+    "磁盘",
+    "硬盘",
+    "满了",
+    "还剩",
+    "ssd",
+    "寿命",
+    "磨损",
+    "固态",
+    "wifi",
+    "wi-fi",
+    "网络",
+    "连网",
+    "无线",
+    "扫描wifi",
+    "扫描网络",
+    "搜wifi",
+    "搜网络",
+    "搜无线",
+    "设备状态",
+    "系统状态",
+    "运行状态",
+    "ip",
+    "信号",
+    "清理",
+    "释放",
+    "腾空间",
+    "加孩子",
+    "绑定孩子",
+    "子网关",  # 子网关绑定 (规则优先, LLM 兜底)
 ]
 
 _DEVICE_IP: str = ""
@@ -206,13 +297,17 @@ def _get_device_ip() -> str:
 
     优先级:
       1. DEVICE_IP 环境变量 (docker-compose 传入宿主机 LAN IP)
-      2. UDP 连接 8.8.8.8 取出口 IP (bridge 模式下也可用)
-      3. hostname -I (host 网络模式)
-      4. socket.gethostbyname 兜底
+      2. ip route get (查询内核路由表, 比 UDP socket 更可靠, 不受 172.x 限制)
+      3. UDP 连接 8.8.8.8 取出口 IP (bridge 模式下也可用)
+      4. hostname -I (host 网络模式)
+      5. socket.gethostbyname 兜底
     """
     global _DEVICE_IP
     if _DEVICE_IP:
         return _DEVICE_IP
+
+    import socket
+    import subprocess
 
     # 1) 环境变量
     env_ip = os.environ.get("DEVICE_IP", "").strip()
@@ -220,8 +315,30 @@ def _get_device_ip() -> str:
         _DEVICE_IP = env_ip
         return env_ip
 
-    # 2) UDP 出口 IP (连接外部地址获取本机出口 IP)
-    import socket
+    # 2) ip route get (查询内核路由表, 拿到真正出口接口 IP)
+    try:
+        r = subprocess.run(
+            ["ip", "route", "get", "8.8.8.8"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            for token in r.stdout.strip().split():
+                if token == "src":
+                    # "8.8.8.8 via 192.168.1.1 dev eth0 src 192.168.1.100"
+                    # src 后面紧跟的就是本机出口 IP
+                    idx = r.stdout.strip().split().index("src")
+                    parts = r.stdout.strip().split()
+                    if idx + 1 < len(parts):
+                        ip = parts[idx + 1]
+                        if ip.count(".") == 3 and not ip.startswith("127."):
+                            _DEVICE_IP = ip
+                            return ip
+    except Exception:
+        pass
+
+    # 3) UDP 出口 IP (连接外部地址获取本机出口 IP)
     for target in ("8.8.8.8", "223.5.5.5", "114.114.114.114"):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -237,9 +354,13 @@ def _get_device_ip() -> str:
 
     # 3) hostname -I (host 网络模式)
     import subprocess
+
     try:
         r = subprocess.run(
-            ["hostname", "-I"], capture_output=True, text=True, timeout=5,
+            ["hostname", "-I"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if r.returncode == 0 and r.stdout.strip():
             ips = r.stdout.strip().split()
@@ -261,9 +382,49 @@ def _get_device_ip() -> str:
     return _DEVICE_IP
 
 
+def _clear_device_ip_cache() -> None:
+    """清除缓存的设备 IP，下次 _get_device_ip() 将重新检测."""
+    global _DEVICE_IP
+    _DEVICE_IP = ""
+
+
+async def _refresh_mdns() -> None:
+    """网络切换后刷新 mDNS 注册 (清除 IP 缓存 + 重启 avahi 广播).
+
+    异步函数, 内部 await 不阻塞事件循环.
+    等待 IP 稳定: nmcli 连接成功后 DHCP 可能需要几秒分配 IP.
+    """
+    import asyncio
+    import subprocess as _sp
+
+    _clear_device_ip_cache()
+    # 等待 IP 稳定, 最多 3 次 (6s)
+    ip = ""
+    for _ in range(3):
+        ip = _get_device_ip()
+        if ip and not ip.startswith("127.") and ip != "0.0.0.0":
+            break
+        await asyncio.sleep(2)
+    if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+        logger.warning("mDNS: 无法获取有效设备 IP (%s), avahi 暂不重启", ip)
+    else:
+        try:
+            _sp.run(["pkill", "-f", "avahi-publish-service"], capture_output=True, timeout=5)
+            logger.info("mDNS: avahi-publish-service 已重启 (IP=%s)", ip)
+        except Exception:
+            pass
+
+
 _ALWAYS_AVAILABLE: set[str] = {
-    "device_command", "device_status", "device_temp", "storage_info", "ssd_health",
-    "wifi_scan", "wifi_configure", "wifi_status", "device_cleanup",
+    "device_command",
+    "device_status",
+    "device_temp",
+    "storage_info",
+    "ssd_health",
+    "wifi_scan",
+    "wifi_configure",
+    "wifi_status",
+    "device_cleanup",
 }
 
 
@@ -271,8 +432,12 @@ def _detect_scene_internal(user_message: str) -> dict:
     msg_lower = user_message.lower()
     for kw in _DEVICE_KEYWORDS:
         if kw.lower() in msg_lower:
-            return {"scene": "full", "confidence": "device",
-                    "scores": {"practice": 0, "reading": 0}, "threshold": 3}
+            return {
+                "scene": "full",
+                "confidence": "device",
+                "scores": {"practice": 0, "reading": 0},
+                "threshold": 3,
+            }
     scores = {"practice": 0, "reading": 0}
     for scene, rule_groups in _SCENE_KEYWORDS.items():
         for keywords, weight in rule_groups:
@@ -290,8 +455,7 @@ def _detect_scene_internal(user_message: str) -> dict:
         detected = "full"
     total = scores["practice"] + scores["reading"]
     confidence = "high" if total >= 5 else ("medium" if total >= 2 else "low")
-    return {"scene": detected, "confidence": confidence,
-            "scores": scores, "threshold": 3}
+    return {"scene": detected, "confidence": confidence, "scores": scores, "threshold": 3}
 
 
 def _check_scene(tool_name: str) -> str | None:
@@ -300,8 +464,13 @@ def _check_scene(tool_name: str) -> str | None:
     if tool_name in _ALWAYS_AVAILABLE:
         return None
     allowed = _SCENE_TOOLS.get(_scene, set())
-    if tool_name in ("set_scene", "detect_scene", "get_scene",
-                     "get_circuit_status", "reset_circuit"):
+    if tool_name in (
+        "set_scene",
+        "detect_scene",
+        "get_scene",
+        "get_circuit_status",
+        "reset_circuit",
+    ):
         return None
     if tool_name not in allowed:
         scene_cn = {"practice": "练习模式", "reading": "阅读模式"}.get(_scene, _scene)
@@ -348,7 +517,9 @@ class CircuitBreaker:
             "threshold": self.failure_threshold,
             "last_failure_age_s": age or None,
             "recovery_timeout_s": self.recovery_timeout,
-            "retry_after_s": max(0, round(self.recovery_timeout - age, 0)) if self._last_failure_time else 0,
+            "retry_after_s": max(0, round(self.recovery_timeout - age, 0))
+            if self._last_failure_time
+            else 0,
         }
 
 
@@ -418,7 +589,9 @@ async def _call_with_retry(coro, tool_name: str, max_retries: int = 1):
         except (httpx.TransportError, httpx.ConnectError, httpx.RemoteProtocolError) as e:
             last_exc = e
             if attempt < max_retries:
-                logger.warning("瞬态错误, 重试 %s (attempt %d/%d): %s", tool_name, attempt + 1, max_retries, e)
+                logger.warning(
+                    "瞬态错误, 重试 %s (attempt %d/%d): %s", tool_name, attempt + 1, max_retries, e
+                )
                 await asyncio.sleep(0.5 * (attempt + 1))
                 continue
             raise
@@ -502,7 +675,9 @@ async def _platform_get(path: str) -> dict:
     if _platform_circuit.is_open:
         return _platform_circuit_open_response()
     if _USE_DIRECT_PROVIDER and _fastapi_app is not None:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_fastapi_app), base_url="http://localhost:8100") as _c:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=_fastapi_app), base_url="http://localhost:8100"
+        ) as _c:
             try:
                 _r = await _c.get(path, timeout=_TIMEOUT_PLATFORM_GET)
                 if _r.status_code == 200:
@@ -537,9 +712,13 @@ async def _platform_post(path: str, data: dict = None) -> dict:
     if tool_name:
         headers["X-Tool-Name"] = tool_name
     if _USE_DIRECT_PROVIDER and _fastapi_app is not None:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_fastapi_app), base_url="http://localhost:8100") as _c:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=_fastapi_app), base_url="http://localhost:8100"
+        ) as _c:
             try:
-                _r = await _c.post(path, json=data or {}, headers=headers, timeout=_TIMEOUT_PLATFORM_POST)
+                _r = await _c.post(
+                    path, json=data or {}, headers=headers, timeout=_TIMEOUT_PLATFORM_POST
+                )
                 if _r.status_code == 200:
                     _platform_circuit.record_success()
                     return _r.json()
@@ -551,7 +730,12 @@ async def _platform_post(path: str, data: dict = None) -> dict:
                 return {"ok": False, "error": f"平台连接失败: {str(e)}"}
     try:
         client = _get_http()
-        r = await client.post(f"{PLATFORM_URL}{path}", json=data or {}, headers=headers, timeout=_TIMEOUT_PLATFORM_POST)
+        r = await client.post(
+            f"{PLATFORM_URL}{path}",
+            json=data or {},
+            headers=headers,
+            timeout=_TIMEOUT_PLATFORM_POST,
+        )
         if r.status_code == 200:
             _platform_circuit.record_success()
             return r.json()
@@ -563,17 +747,27 @@ async def _platform_post(path: str, data: dict = None) -> dict:
         return {"ok": False, "error": f"平台连接失败: {str(e)}"}
 
 
-async def _platform_upload(path: str, data: dict, file_path: str, filename: str, headers: dict = None) -> dict:
+async def _platform_upload(
+    path: str, data: dict, file_path: str, filename: str, headers: dict = None
+) -> dict:
     """Multipart file upload to platform API. Direct mode uses ASGI transport."""
     global _platform_circuit
     if _platform_circuit.is_open:
         return _platform_circuit_open_response()
     _headers = headers or {}
     if _USE_DIRECT_PROVIDER and _fastapi_app is not None:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_fastapi_app), base_url="http://localhost:8100") as _c:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=_fastapi_app), base_url="http://localhost:8100"
+        ) as _c:
             with open(file_path, "rb") as _f:
                 try:
-                    _r = await _c.post(path, data=data, files={"file": (filename, _f, "application/octet-stream")}, headers=_headers, timeout=_TIMEOUT_PLATFORM_POST)
+                    _r = await _c.post(
+                        path,
+                        data=data,
+                        files={"file": (filename, _f, "application/octet-stream")},
+                        headers=_headers,
+                        timeout=_TIMEOUT_PLATFORM_POST,
+                    )
                     if _r.status_code == 200:
                         _platform_circuit.record_success()
                         return json.loads(_r.text) if _r.text.strip() else {}
@@ -585,7 +779,13 @@ async def _platform_upload(path: str, data: dict, file_path: str, filename: str,
                     return {"ok": False, "error": f"平台连接失败: {str(e)}"}
     client = _get_http()
     with open(file_path, "rb") as f:
-        r = await client.post(f"{PLATFORM_URL}{path}", data=data, files={"file": (filename, f, "application/octet-stream")}, headers=_headers, timeout=_TIMEOUT_PLATFORM_POST)
+        r = await client.post(
+            f"{PLATFORM_URL}{path}",
+            data=data,
+            files={"file": (filename, f, "application/octet-stream")},
+            headers=_headers,
+            timeout=_TIMEOUT_PLATFORM_POST,
+        )
     if r.status_code == 200:
         _platform_circuit.record_success()
         return json.loads(r.text) if r.text.strip() else {}
@@ -647,9 +847,12 @@ async def _dm_post(path: str, data: dict = None, timeout: int = 35) -> dict:
 # MCP Tools — unchanged from deeptutor_mcp
 # ═══════════════════════════════════════════════
 
+
 @mcp.tool()
 async def get_scene() -> str:
-    allowed = _SCENE_TOOLS.get(_scene, set()) if _scene != "full" else set(_TOOL_DESCRIPTIONS.keys())
+    allowed = (
+        _SCENE_TOOLS.get(_scene, set()) if _scene != "full" else set(_TOOL_DESCRIPTIONS.keys())
+    )
     result = {
         "scene": _scene,
         "available_tools": sorted(allowed),
@@ -680,9 +883,14 @@ async def set_scene(mode: str, user_message: str = "") -> str:
         _scene = mode
     else:
         return json.dumps({"ok": False, "error": f"Unknown mode: {mode}"}, ensure_ascii=False)
-    return json.dumps({"ok": True, "scene": _scene,
-                       "tools": sorted(_SCENE_TOOLS.get(_scene, set())) if _scene != "full" else "all"},
-                      ensure_ascii=False)
+    return json.dumps(
+        {
+            "ok": True,
+            "scene": _scene,
+            "tools": sorted(_SCENE_TOOLS.get(_scene, set())) if _scene != "full" else "all",
+        },
+        ensure_ascii=False,
+    )
 
 
 @mcp.tool()
@@ -693,7 +901,9 @@ async def get_circuit_status(agent_role: str = "") -> str:
     dt_s = _dt_circuit.status()
     plat_s = _platform_circuit.status()
     dm_s = _dm_circuit.status()
-    return json.dumps({"deeptutor": dt_s, "platform": plat_s, "device_manager": dm_s}, ensure_ascii=False)
+    return json.dumps(
+        {"deeptutor": dt_s, "platform": plat_s, "device_manager": dm_s}, ensure_ascii=False
+    )
 
 
 @mcp.tool()
@@ -702,13 +912,19 @@ async def reset_circuit(target: str = "deeptutor", agent_role: str = "") -> str:
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
     results = []
-    for name, cb in [("deeptutor", _dt_circuit), ("platform", _platform_circuit), ("device_manager", _dm_circuit)]:
+    for name, cb in [
+        ("deeptutor", _dt_circuit),
+        ("platform", _platform_circuit),
+        ("device_manager", _dm_circuit),
+    ]:
         if target in (name, "all"):
             prev = cb._state
             cb._failure_count = 0
             cb._state = "closed"
             results.append({"circuit": name, "previous_state": prev, "current_state": "closed"})
-    return json.dumps({"ok": True, "action": "circuit_reset", "results": results}, ensure_ascii=False)
+    return json.dumps(
+        {"ok": True, "action": "circuit_reset", "results": results}, ensure_ascii=False
+    )
 
 
 @mcp.tool()
@@ -730,17 +946,18 @@ async def kb_search(query: str, kb_name: str = "tutoring", top_k: int = 5) -> st
         try:
             files = await _dt_get(f"/api/v1/knowledge/{kb_name}/files")
             if isinstance(files, list):
-                import re
                 q_lower = query.lower()
                 for f in files:
                     fname = (f.get("filename") or f.get("name", "")).lower()
                     if q_lower in fname or any(kw in fname for kw in q_lower.split()):
-                        dt_data.append({
-                            "_source": "llamaindex",
-                            "filename": f.get("filename") or f.get("name", ""),
-                            "score": 0.9,
-                            "text": f"文件: {f.get('filename') or f.get('name', '')}",
-                        })
+                        dt_data.append(
+                            {
+                                "_source": "llamaindex",
+                                "filename": f.get("filename") or f.get("name", ""),
+                                "score": 0.9,
+                                "text": f"文件: {f.get('filename') or f.get('name', '')}",
+                            }
+                        )
         except Exception:
             pass
 
@@ -754,12 +971,19 @@ async def kb_search(query: str, kb_name: str = "tutoring", top_k: int = 5) -> st
 
         merged = merged[:top_k]
         if merged:
-            return json.dumps({"ok": True, "results": merged, "total": len(merged)}, ensure_ascii=False)
+            return json.dumps(
+                {"ok": True, "results": merged, "total": len(merged)}, ensure_ascii=False
+            )
 
-        return json.dumps({
-            "ok": True, "results": [], "total": 0,
-            "message": "知识库中暂无相关内容, 请先上传学习资料",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "ok": True,
+                "results": [],
+                "total": 0,
+                "message": "知识库中暂无相关内容, 请先上传学习资料",
+            },
+            ensure_ascii=False,
+        )
 
     return await _guarded_call("kb_search", _run())
 
@@ -769,21 +993,31 @@ async def kb_list() -> str:
     async def _run():
         result = await _dt_get("/api/v1/knowledge/")
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("kb_list", _run())
 
 
 @mcp.tool()
-async def kb_upload_text(kb_name: str, content: str, filename: str = "",
-                         learner_id: str = "default") -> str:
+async def kb_upload_text(
+    kb_name: str, content: str, filename: str = "", learner_id: str = "default"
+) -> str:
     perm = _check_tool_permission("kb_upload_text", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
-        result = await _platform_post("/api/ingest/text", {
-            "kb_name": kb_name, "content": content, "filename": filename,
-            "source": "mcp", "learner_id": learner_id,
-        })
+        result = await _platform_post(
+            "/api/ingest/text",
+            {
+                "kb_name": kb_name,
+                "content": content,
+                "filename": filename,
+                "source": "mcp",
+                "learner_id": learner_id,
+            },
+        )
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("kb_upload_text", _run())
 
 
@@ -792,6 +1026,7 @@ async def kb_upload_file(kb_name: str, file_path: str, learner_id: str = "defaul
     perm = _check_tool_permission("kb_upload_file", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         actual_path = file_path
         if not os.path.exists(actual_path):
@@ -804,7 +1039,7 @@ async def kb_upload_file(kb_name: str, file_path: str, learner_id: str = "defaul
                 ("/root/.hermes", "/data/hermes"),
             ):
                 if file_path.startswith(prefix + "/") or file_path == prefix:
-                    translated = replacement + file_path[len(prefix):]
+                    translated = replacement + file_path[len(prefix) :]
                     break
             if translated != file_path and os.path.exists(translated):
                 logger.warning("kb_upload_file path translated: %s -> %s", file_path, translated)
@@ -815,7 +1050,9 @@ async def kb_upload_file(kb_name: str, file_path: str, learner_id: str = "defaul
                     logger.warning("kb_upload_file path fallback: %s -> %s", file_path, alt)
                     actual_path = alt
         if not os.path.exists(actual_path):
-            return json.dumps({"ok": False, "error": f"File not found: {file_path}"}, ensure_ascii=False)
+            return json.dumps(
+                {"ok": False, "error": f"File not found: {file_path}"}, ensure_ascii=False
+            )
         filename = os.path.basename(actual_path)
         headers = {}
         tool_name = _current_tool.get("")
@@ -824,9 +1061,12 @@ async def kb_upload_file(kb_name: str, file_path: str, learner_id: str = "defaul
         data = await _platform_upload(
             "/api/ingest/file",
             {"kb_name": kb_name, "learner_id": learner_id},
-            actual_path, filename, headers,
+            actual_path,
+            filename,
+            headers,
         )
         return json.dumps(data, ensure_ascii=False)
+
     return await _guarded_call("kb_upload_file", _run())
 
 
@@ -835,6 +1075,7 @@ async def session_read(learner_id: str = "", limit: int = 10) -> str:
     perm = _check_tool_permission("session_read", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         results = []
         try:
@@ -859,17 +1100,21 @@ async def session_read(learner_id: str = "", limit: int = 10) -> str:
                 solve_sessions = await _dt_get(f"/api/v1/solve/sessions?limit={limit}")
                 if isinstance(solve_sessions, list):
                     for s in solve_sessions:
-                        results.append({
-                            "session_id": s.get("id", ""),
-                            "title": s.get("title", s.get("problem", "")),
-                            "created_at": s.get("created_at", s.get("timestamp", "")),
-                            "source": "deeptutor_solve",
-                        })
+                        results.append(
+                            {
+                                "session_id": s.get("id", ""),
+                                "title": s.get("title", s.get("problem", "")),
+                                "created_at": s.get("created_at", s.get("timestamp", "")),
+                                "source": "deeptutor_solve",
+                            }
+                        )
             except Exception:
                 pass
 
         if results:
-            return json.dumps({"ok": True, "sessions": results[:limit], "total": len(results)}, ensure_ascii=False)
+            return json.dumps(
+                {"ok": True, "sessions": results[:limit], "total": len(results)}, ensure_ascii=False
+            )
         return json.dumps({"ok": True, "sessions": [], "total": 0, "message": "暂无学习会话记录"})
 
     return await _guarded_call("session_read", _run())
@@ -893,10 +1138,12 @@ async def view_source(trace_id: str) -> str:
         return json.dumps({"ok": False, "error": f"读取归档目录失败: {e}"}, ensure_ascii=False)
 
     if not matches:
-        return json.dumps({"ok": False, "error": f"未找到 trace_id={trace_id} 的归档文件"}, ensure_ascii=False)
+        return json.dumps(
+            {"ok": False, "error": f"未找到 trace_id={trace_id} 的归档文件"}, ensure_ascii=False
+        )
 
-    from datetime import datetime
     import base64
+    from datetime import datetime
 
     results = []
     for filename in sorted(matches):
@@ -905,7 +1152,17 @@ async def view_source(trace_id: str) -> str:
             st = os.stat(filepath)
             ext = os.path.splitext(filename)[1].lower()
             is_image = ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp")
-            is_text = ext in (".txt", ".md", ".html", ".htm", ".json", ".csv", ".xml", ".yaml", ".yml")
+            is_text = ext in (
+                ".txt",
+                ".md",
+                ".html",
+                ".htm",
+                ".json",
+                ".csv",
+                ".xml",
+                ".yaml",
+                ".yml",
+            )
 
             info: dict = {
                 "filename": filename,
@@ -917,12 +1174,12 @@ async def view_source(trace_id: str) -> str:
             }
 
             if is_image:
-                with open(filepath, "rb") as f:
-                    info["content_base64"] = base64.b64encode(f.read()).decode()
+                with open(filepath, "rb") as fh:
+                    info["content_base64"] = base64.b64encode(fh.read()).decode()
                     info["content_type"] = f"image/{ext.lstrip('.')}"
             elif is_text:
-                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                    info["content_text"] = f.read()
+                with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                    info["content_text"] = fh.read()
 
             results.append(info)
         except OSError as e:
@@ -936,12 +1193,14 @@ async def quiz_review(learner_id: str, kp_id: str = "", limit: int = 10) -> str:
     perm = _check_tool_permission("quiz_review", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         url = f"/api/mastery/{learner_id}/wrong?limit={limit}"
         if kp_id:
             url += f"&kp_id={kp_id}"
         result = await _platform_get(url)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("quiz_review", _run())
 
 
@@ -959,13 +1218,20 @@ async def generate_practice(learner_id: str, kp_id: str = "", count: int = 3) ->
     perm = _check_tool_permission("generate_practice", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         if _platform_circuit.is_open:
             return json.dumps(_platform_circuit_open_response(), ensure_ascii=False)
-        result = await _platform_post("/api/practice/generate", {
-            "learner_id": learner_id, "kp_id": kp_id, "count": count,
-        })
+        result = await _platform_post(
+            "/api/practice/generate",
+            {
+                "learner_id": learner_id,
+                "kp_id": kp_id,
+                "count": count,
+            },
+        )
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("generate_practice", _run())
 
 
@@ -984,13 +1250,20 @@ async def generate_exam_paper(learner_id: str, kp_id: str = "", count: int = 10)
     perm = _check_tool_permission("generate_exam_paper", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         if _platform_circuit.is_open:
             return json.dumps(_platform_circuit_open_response(), ensure_ascii=False)
-        result = await _platform_post("/api/practice/exam", {
-            "learner_id": learner_id, "kp_id": kp_id, "count": count,
-        })
+        result = await _platform_post(
+            "/api/practice/exam",
+            {
+                "learner_id": learner_id,
+                "kp_id": kp_id,
+                "count": count,
+            },
+        )
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("generate_exam_paper", _run())
 
 
@@ -1009,13 +1282,20 @@ async def deep_solve(learner_id: str, problem: str, detailed: bool = False) -> s
     perm = _check_tool_permission("deep_solve", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         if _platform_circuit.is_open:
             return json.dumps(_platform_circuit_open_response(), ensure_ascii=False)
-        result = await _platform_post("/api/solve", {
-            "learner_id": learner_id, "question": problem, "detailed": detailed,
-        })
+        result = await _platform_post(
+            "/api/solve",
+            {
+                "learner_id": learner_id,
+                "question": problem,
+                "detailed": detailed,
+            },
+        )
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("deep_solve", _run())
 
 
@@ -1034,13 +1314,20 @@ async def vision_solve(learner_id: str, file_path: str, question: str = "") -> s
     perm = _check_tool_permission("vision_solve", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         if _platform_circuit.is_open:
             return json.dumps(_platform_circuit_open_response(), ensure_ascii=False)
-        result = await _platform_post("/api/vision/solve", {
-            "learner_id": learner_id, "image_data": file_path, "question": question,
-        })
+        result = await _platform_post(
+            "/api/vision/solve",
+            {
+                "learner_id": learner_id,
+                "image_data": file_path,
+                "question": question,
+            },
+        )
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("vision_solve", _run())
 
 
@@ -1058,15 +1345,19 @@ async def update_memory(learner_id: str, file: str, content: str) -> str:
     - content: 要保存的内容（markdown 格式）
     """
     if file not in ("summary", "profile"):
-        return json.dumps({"ok": False, "error": "file 参数必须是 summary 或 profile"}, ensure_ascii=False)
+        return json.dumps(
+            {"ok": False, "error": "file 参数必须是 summary 或 profile"}, ensure_ascii=False
+        )
     perm = _check_tool_permission("update_memory", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         if _dt_circuit.is_open:
             return _circuit_open_response("deeptutor")
         result = await _dt_put("/api/v1/memory", {"file": file, "content": content})
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("update_memory", _run())
 
 
@@ -1086,25 +1377,28 @@ async def record_quiz_result(session_id: str, results: str, learner_id: str = ""
     perm = _check_tool_permission("record_quiz_result", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         if _dt_circuit.is_open:
             return _circuit_open_response("deeptutor")
         try:
             import json as _json
+
             answers = _json.loads(results) if isinstance(results, str) else results
         except Exception as e:
             return json.dumps({"ok": False, "error": f"results 格式错误: {e}"}, ensure_ascii=False)
         if not isinstance(answers, list):
             return json.dumps({"ok": False, "error": "results 必须是数组"}, ensure_ascii=False)
-        result = await _dt_post(f"/api/v1/sessions/{session_id}/quiz-results",
-                                {"answers": answers})
+        result = await _dt_post(f"/api/v1/sessions/{session_id}/quiz-results", {"answers": answers})
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("record_quiz_result", _run())
 
 
 @mcp.tool()
-async def question_notebook_list(learner_id: str = "", limit: int = 20,
-                                  is_correct: bool | None = None) -> str:
+async def question_notebook_list(
+    learner_id: str = "", limit: int = 20, is_correct: bool | None = None
+) -> str:
     """查询学习历史中的所有答题记录（含纠错本）。
 
     查看学生历史的答题记录，可按是否正确过滤。
@@ -1118,6 +1412,7 @@ async def question_notebook_list(learner_id: str = "", limit: int = 20,
     perm = _check_tool_permission("question_notebook_list", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         if _dt_circuit.is_open:
             return _circuit_open_response("deeptutor")
@@ -1126,6 +1421,7 @@ async def question_notebook_list(learner_id: str = "", limit: int = 20,
             params += f"&is_correct={'true' if is_correct else 'false'}"
         result = await _dt_get(f"/api/v1/question-notebook/entries{params}")
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("question_notebook_list", _run())
 
 
@@ -1137,6 +1433,7 @@ async def book_create(topic: str, kb_name: str = "") -> str:
             data["kb_name"] = kb_name
         result = await _dt_post("/api/v1/book/books", data)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("book_create", _run())
 
 
@@ -1148,6 +1445,7 @@ async def book_read(book_id: str, page_id: str = "") -> str:
         else:
             result = await _dt_get(f"/api/v1/book/books/{book_id}")
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("book_read", _run())
 
 
@@ -1156,6 +1454,7 @@ async def book_list() -> str:
     async def _run():
         result = await _dt_get("/api/v1/book/books")
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("book_list", _run())
 
 
@@ -1164,19 +1463,24 @@ async def get_memory(learner_id: str) -> str:
     perm = _check_tool_permission("get_memory", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dt_get(f"/api/v1/memory/?learner_id={learner_id}")
         # Signal new learner when global memory is empty (no summary/profile data)
         result["is_new_learner"] = not (result.get("summary") or result.get("profile"))
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("get_memory", _run())
 
 
 @mcp.tool()
-async def process_file(file_path: str, kb_name: str = "tutoring", learner_id: str = "default") -> str:
+async def process_file(
+    file_path: str, kb_name: str = "tutoring", learner_id: str = "default"
+) -> str:
     perm = _check_tool_permission("process_file", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         actual_path = file_path
         if not os.path.exists(actual_path):
@@ -1190,7 +1494,7 @@ async def process_file(file_path: str, kb_name: str = "tutoring", learner_id: st
                 ("/root/.hermes", "/data/hermes"),
             ):
                 if file_path.startswith(prefix + "/") or file_path == prefix:
-                    translated = replacement + file_path[len(prefix):]
+                    translated = replacement + file_path[len(prefix) :]
                     break
             if translated != file_path and os.path.exists(translated):
                 logger.warning("process_file path translated: %s -> %s", file_path, translated)
@@ -1210,17 +1514,22 @@ async def process_file(file_path: str, kb_name: str = "tutoring", learner_id: st
             data = await _platform_upload(
                 "/api/process/file",
                 {"kb_name": kb_name, "learner_id": learner_id},
-                actual_path, filename, headers,
+                actual_path,
+                filename,
+                headers,
             )
             if data.get("tutor_content"):
                 return json.dumps({"tutor_content": data["tutor_content"]}, ensure_ascii=False)
             return json.dumps(data, ensure_ascii=False)
         else:
-            result = await _platform_post("/api/process/file", {
-                "file_path": file_path,
-                "kb_name": kb_name,
-                "learner_id": learner_id,
-            })
+            result = await _platform_post(
+                "/api/process/file",
+                {
+                    "file_path": file_path,
+                    "kb_name": kb_name,
+                    "learner_id": learner_id,
+                },
+            )
             if result.get("tutor_content"):
                 return json.dumps({"tutor_content": result["tutor_content"]}, ensure_ascii=False)
             return json.dumps(result, ensure_ascii=False)
@@ -1236,6 +1545,7 @@ async def notebook_create(title: str, kb_name: str = "") -> str:
             data["kb_name"] = kb_name
         result = await _dt_post("/api/v1/notebook/notebooks", data)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("notebook_create", _run())
 
 
@@ -1247,24 +1557,30 @@ async def notebook_read(notebook_id: str, cell_id: str = "") -> str:
         else:
             result = await _dt_get(f"/api/v1/notebook/notebooks/{notebook_id}")
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("notebook_read", _run())
 
 
 @mcp.tool()
-async def notebook_add_cell(notebook_id: str, cell_type: str = "markdown",
-                             content: str = "", language: str = "python") -> str:
+async def notebook_add_cell(
+    notebook_id: str, cell_type: str = "markdown", content: str = "", language: str = "python"
+) -> str:
     async def _run():
         data = {"cell_type": cell_type, "content": content, "language": language}
         result = await _dt_post(f"/api/v1/notebook/notebooks/{notebook_id}/cells", data)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("notebook_add_cell", _run())
 
 
 @mcp.tool()
 async def notebook_execute(notebook_id: str, cell_id: str) -> str:
     async def _run():
-        result = await _dt_post(f"/api/v1/notebook/notebooks/{notebook_id}/cells/{cell_id}/execute", {})
+        result = await _dt_post(
+            f"/api/v1/notebook/notebooks/{notebook_id}/cells/{cell_id}/execute", {}
+        )
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("notebook_execute", _run())
 
 
@@ -1273,11 +1589,14 @@ async def notebook_list() -> str:
     async def _run():
         result = await _dt_get("/api/v1/notebook/notebooks")
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("notebook_list", _run())
 
 
 @mcp.tool()
-async def tutor_chat(message: str, learner_id: str = "default", context: str = "", mode: str = "guide") -> str:
+async def tutor_chat(
+    message: str, learner_id: str = "default", context: str = "", mode: str = "guide"
+) -> str:
     """将教学消息转发给 DeepTutor 教学引擎。学生问学习问题、做题、对答案时必须调用此工具。
 
     两种教学模式:
@@ -1299,6 +1618,7 @@ async def tutor_chat(message: str, learner_id: str = "default", context: str = "
     perm = _check_tool_permission("tutor_chat", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         if _platform_circuit.is_open:
             return json.dumps(_platform_circuit_open_response(), ensure_ascii=False)
@@ -1322,7 +1642,10 @@ async def tutor_chat(message: str, learner_id: str = "default", context: str = "
             return json.dumps({"ok": False, "error": f"HTTP {r.status_code}"}, ensure_ascii=False)
         except Exception as e:
             _platform_circuit.record_failure()
-            return json.dumps({"ok": False, "error": f"教学引擎调用失败: {str(e)}"}, ensure_ascii=False)
+            return json.dumps(
+                {"ok": False, "error": f"教学引擎调用失败: {str(e)}"}, ensure_ascii=False
+            )
+
     return await _guarded_call("tutor_chat", _run())
 
 
@@ -1345,6 +1668,7 @@ async def get_bot_qrcode(agent_role: str = "", bot_type: str = "child") -> list:
     perm = _check_device_permission(agent_role)
     if perm:
         return [TextContent(type="text", text=perm)]
+
     async def _run_qr():
         try:
             async with httpx.AsyncClient(timeout=20) as client:
@@ -1371,9 +1695,15 @@ async def get_bot_qrcode(agent_role: str = "", bot_type: str = "child") -> list:
                         # 孩子未绑定 → 自动降级到 bind_child
                         if bot_type == "child" and "尚未绑定" in err_msg:
                             return await _bind_child_fallback()
-                        return [TextContent(type="text", text=f"获取二维码失败: {err_msg or '未知错误'}")]
+                        return [
+                            TextContent(
+                                type="text", text=f"获取二维码失败: {err_msg or '未知错误'}"
+                            )
+                        ]
                     except Exception:
-                        return [TextContent(type="text", text="获取二维码失败: 服务器返回了非图片数据")]
+                        return [
+                            TextContent(type="text", text="获取二维码失败: 服务器返回了非图片数据")
+                        ]
 
                 qr_b64 = base64.b64encode(r.content).decode()
                 return [
@@ -1394,20 +1724,37 @@ async def get_bot_qrcode(agent_role: str = "", bot_type: str = "child") -> list:
                 if r.status_code != 200:
                     try:
                         err_body = r.json()
-                        return [TextContent(type="text", text=f"绑定孩子机器人失败: {err_body.get('error', f'HTTP {r.status_code}')}")]
+                        return [
+                            TextContent(
+                                type="text",
+                                text=f"绑定孩子机器人失败: {err_body.get('error', f'HTTP {r.status_code}')}",
+                            )
+                        ]
                     except Exception:
-                        return [TextContent(type="text", text=f"绑定孩子机器人失败: HTTP {r.status_code}")]
+                        return [
+                            TextContent(
+                                type="text", text=f"绑定孩子机器人失败: HTTP {r.status_code}"
+                            )
+                        ]
                 if "image" in r.headers.get("content-type", ""):
                     qr_b64 = base64.b64encode(r.content).decode()
                     return [
                         ImageContent(type="image", data=qr_b64, mimeType="image/png"),
-                        TextContent(type="text", text="孩子机器人已创建，请保存二维码并转发给孩子扫码"),
+                        TextContent(
+                            type="text", text="孩子机器人已创建，请保存二维码并转发给孩子扫码"
+                        ),
                     ]
                 try:
                     body = r.json()
-                    return [TextContent(type="text", text=f"绑定孩子机器人失败: {body.get('error', '未知错误')}")]
+                    return [
+                        TextContent(
+                            type="text", text=f"绑定孩子机器人失败: {body.get('error', '未知错误')}"
+                        )
+                    ]
                 except Exception:
-                    return [TextContent(type="text", text="绑定孩子机器人失败: 服务器返回了非图片数据")]
+                    return [
+                        TextContent(type="text", text="绑定孩子机器人失败: 服务器返回了非图片数据")
+                    ]
         except Exception as e:
             return [TextContent(type="text", text=f"绑定孩子机器人失败: {str(e)}")]
 
@@ -1457,10 +1804,21 @@ async def bind_child_bot(agent_role: str = "", force: bool = False) -> list:
                 try:
                     body = r.json()
                     if body.get("ok") and body.get("text_only"):
-                        return [TextContent(type="text", text=f"请使用以下链接生成二维码:\n{body.get('url', '')}")]
-                    return [TextContent(type="text", text=f"绑定孩子机器人失败: {body.get('error', '未知错误')}")]
+                        return [
+                            TextContent(
+                                type="text",
+                                text=f"请使用以下链接生成二维码:\n{body.get('url', '')}",
+                            )
+                        ]
+                    return [
+                        TextContent(
+                            type="text", text=f"绑定孩子机器人失败: {body.get('error', '未知错误')}"
+                        )
+                    ]
                 except Exception:
-                    return [TextContent(type="text", text=f"绑定孩子机器人失败: 服务器返回了非图片数据")]
+                    return [
+                        TextContent(type="text", text="绑定孩子机器人失败: 服务器返回了非图片数据")
+                    ]
         except Exception as e:
             return [TextContent(type="text", text=f"绑定孩子机器人失败: {str(e)}")]
 
@@ -1468,8 +1826,9 @@ async def bind_child_bot(agent_role: str = "", force: bool = False) -> list:
 
 
 @mcp.tool()
-async def cowriter_edit(text: str, instruction: str, action: str = "rewrite",
-                        source: str = "", kb_name: str = "") -> str:
+async def cowriter_edit(
+    text: str, instruction: str, action: str = "rewrite", source: str = "", kb_name: str = ""
+) -> str:
     async def _run():
         body = {"text": text, "instruction": instruction, "action": action}
         if source in ("rag", "web"):
@@ -1478,12 +1837,12 @@ async def cowriter_edit(text: str, instruction: str, action: str = "rewrite",
                 body["kb_name"] = kb_name
         result = await _dt_post("/api/v1/co_writer/edit", body)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("cowriter_edit", _run())
 
 
 @mcp.tool()
-async def cowriter_documents(list_only: bool = True, title: str = "",
-                             content: str = "") -> str:
+async def cowriter_documents(list_only: bool = True, title: str = "", content: str = "") -> str:
     async def _run():
         if list_only:
             result = await _dt_get("/api/v1/co_writer/documents")
@@ -1496,6 +1855,7 @@ async def cowriter_documents(list_only: bool = True, title: str = "",
                 body["content"] = content
             result = await _dt_post("/api/v1/co_writer/documents", body)
             return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("cowriter_documents", _run())
 
 
@@ -1507,6 +1867,7 @@ async def cowriter_history(operation_id: str = "") -> str:
         else:
             result = await _dt_get("/api/v1/co_writer/history")
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("cowriter_history", _run())
 
 
@@ -1521,6 +1882,7 @@ async def generate_report(learner_id: str, report_type: str = "daily") -> str:
     perm = _check_tool_permission("generate_report", learner_id)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         client = _get_http()
         try:
@@ -1534,6 +1896,7 @@ async def generate_report(learner_id: str, report_type: str = "daily") -> str:
             return json.dumps({"ok": False, "error": f"HTTP {r.status_code}"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
     return await _guarded_call("generate_report", _run())
 
 
@@ -1548,6 +1911,7 @@ async def push_report(report_type: str = "daily") -> str:
     perm = _check_tool_permission("push_report", "")
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         client = _get_http()
         try:
@@ -1562,19 +1926,23 @@ async def push_report(report_type: str = "daily") -> str:
             return json.dumps({"ok": False, "error": f"HTTP {r.status_code}"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
     return await _guarded_call("push_report", _run())
 
 
 # Device tools
+
 
 @mcp.tool()
 async def device_status(agent_role: str = "") -> str:
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_get("/api/device/status", timeout=_TIMEOUT_DM_FAST)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("device_status", _run())
 
 
@@ -1583,9 +1951,11 @@ async def storage_info(agent_role: str = "") -> str:
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_get("/api/device/storage", timeout=_TIMEOUT_DM_FAST)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("storage_info", _run())
 
 
@@ -1594,9 +1964,11 @@ async def ssd_health(agent_role: str = "") -> str:
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_get("/api/device/ssd", timeout=_TIMEOUT_DM_FAST)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("ssd_health", _run())
 
 
@@ -1605,9 +1977,11 @@ async def device_temp(agent_role: str = "") -> str:
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_get("/api/device/temp", timeout=_TIMEOUT_DM_FAST)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("device_temp", _run())
 
 
@@ -1617,9 +1991,11 @@ async def device_alerts(agent_role: str = "") -> str:
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_get("/api/device/alerts", timeout=_TIMEOUT_DM_FAST)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("device_alerts", _run())
 
 
@@ -1627,20 +2003,20 @@ async def device_alerts(agent_role: str = "") -> str:
 
 _PARAMETERLESS_DEVICE_TOOLS: dict[str, tuple[str, str, int]] = {
     # tool_name: (http_method, api_path, timeout)
-    "wifi_scan":      ("GET",  "/api/device/wifi/scan",    _TIMEOUT_DM_SCAN),
-    "wifi_status":    ("GET",  "/api/device/wifi/status",  _TIMEOUT_DM_FAST),
-    "device_status":  ("GET",  "/api/device/status",       _TIMEOUT_DM_FAST),
-    "device_alerts":  ("GET",  "/api/device/alerts",       _TIMEOUT_DM_FAST),
-    "storage_info":   ("GET",  "/api/device/storage",      _TIMEOUT_DM_FAST),
-    "ssd_health":     ("GET",  "/api/device/ssd",          _TIMEOUT_DM_FAST),
-    "device_temp":    ("GET",  "/api/device/temp",         _TIMEOUT_DM_FAST),
-    "device_cleanup": ("POST", "/api/device/cleanup",      _TIMEOUT_DM_CLEANUP),
+    "wifi_scan": ("GET", "/api/device/wifi/scan", _TIMEOUT_DM_SCAN),
+    "wifi_status": ("GET", "/api/device/wifi/status", _TIMEOUT_DM_FAST),
+    "device_status": ("GET", "/api/device/status", _TIMEOUT_DM_FAST),
+    "device_alerts": ("GET", "/api/device/alerts", _TIMEOUT_DM_FAST),
+    "storage_info": ("GET", "/api/device/storage", _TIMEOUT_DM_FAST),
+    "ssd_health": ("GET", "/api/device/ssd", _TIMEOUT_DM_FAST),
+    "device_temp": ("GET", "/api/device/temp", _TIMEOUT_DM_FAST),
+    "device_cleanup": ("POST", "/api/device/cleanup", _TIMEOUT_DM_CLEANUP),
 }
 
 # 需要 LLM 提取参数的工具 (规则只负责分类, 不执行)
 _PARAM_REQUIRED_DEVICE_TOOLS: set[str] = {
     "wifi_configure",  # 需 ssid + password
-    "wifi_forget",     # 需 ssid
+    "wifi_forget",  # 需 ssid
     "get_bot_qrcode",  # 需 bot_type + agent_role (规则识别后 LLM 提取参数)
 }
 
@@ -1668,7 +2044,9 @@ async def device_command(text: str, agent_role: str = "") -> str:
     try:
         from tutor_platform.tools.intent_rules import classify_device_intent, get_device_tool_name
     except ImportError:
-        return json.dumps({"intent": "unclassified", "reason": "规则引擎不可用"}, ensure_ascii=False)
+        return json.dumps(
+            {"intent": "unclassified", "reason": "规则引擎不可用"}, ensure_ascii=False
+        )
 
     classification = classify_device_intent(text)
     intent = classification.get("intent", "none")
@@ -1676,23 +2054,29 @@ async def device_command(text: str, agent_role: str = "") -> str:
     description = classification.get("description", "")
 
     if intent == "none" or confidence < _HIGH_CONFIDENCE_THRESHOLD:
-        return json.dumps({
-            "intent": "unclassified",
-            "confidence": confidence,
-            "hint": "规则未匹配，由 LLM 自行判断",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "intent": "unclassified",
+                "confidence": confidence,
+                "hint": "规则未匹配，由 LLM 自行判断",
+            },
+            ensure_ascii=False,
+        )
 
     tool_name = get_device_tool_name(intent)
 
     if tool_name in _PARAM_REQUIRED_DEVICE_TOOLS:
-        return json.dumps({
-            "intent": intent,
-            "tool": tool_name,
-            "confidence": confidence,
-            "description": description,
-            "requires_params": True,
-            "instruction": f"规则已识别为「{description}」，请从对话中提取参数后调用 {tool_name}",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "intent": intent,
+                "tool": tool_name,
+                "confidence": confidence,
+                "description": description,
+                "requires_params": True,
+                "instruction": f"规则已识别为「{description}」，请从对话中提取参数后调用 {tool_name}",
+            },
+            ensure_ascii=False,
+        )
 
     if tool_name in _PARAMETERLESS_DEVICE_TOOLS:
         method, path, timeout = _PARAMETERLESS_DEVICE_TOOLS[tool_name]
@@ -1707,47 +2091,70 @@ async def device_command(text: str, agent_role: str = "") -> str:
         except Exception as e:
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-    return json.dumps({
-        "intent": "unclassified",
-        "confidence": confidence,
-        "hint": f"已识别为 {intent} 但无对应工具实现，由 LLM 自行判断",
-    }, ensure_ascii=False)
+    return json.dumps(
+        {
+            "intent": "unclassified",
+            "confidence": confidence,
+            "hint": f"已识别为 {intent} 但无对应工具实现，由 LLM 自行判断",
+        },
+        ensure_ascii=False,
+    )
 
 
 @mcp.tool()
 async def wifi_scan(agent_role: str = "") -> str:
+    """扫描周围的可用 WiFi 网络，返回 SSID/信号强度/安全类型列表。仅家长可用。"""
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_get("/api/device/wifi/scan", timeout=_TIMEOUT_DM_SCAN)
+        if result.get("ok") and isinstance(result.get("data"), list):
+            networks = result["data"]
+            if networks and networks[0].get("ssid", "").startswith("模拟"):
+                result["simulated"] = True
+                result["hint"] = "⚠️ 模拟环境 (nmcli 不可用)"
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("wifi_scan", _run())
 
 
 @mcp.tool()
 async def wifi_configure(ssid: str, password: str, agent_role: str = "") -> str:
+    """连接 WiFi 网络 (需 SSID 和密码)。连接成功后自动刷新 mDNS 广播。仅家长可用。"""
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_post(
             "/api/device/wifi/connect",
             data={"ssid": ssid, "password": password},
             timeout=_TIMEOUT_DM_CONFIGURE,
         )
+        if result.get("ok") and result.get("data", {}).get("success"):
+            await _refresh_mdns()
+            is_mock = "模拟" in json.dumps(result.get("data", {}), ensure_ascii=False)
+            data = dict(result.get("data", {}))
+            data["hint"] = "⚠️ 模拟环境" if is_mock else "手机和设备需连同一 WiFi 才能访问设备页面"
+            return json.dumps({"ok": True, "data": data}, ensure_ascii=False)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("wifi_configure", _run())
 
 
 @mcp.tool()
 async def wifi_status(agent_role: str = "") -> str:
+    """查看当前 WiFi 连接状态：是否已连接、SSID、信号强度、IP 地址。仅家长可用。"""
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_get("/api/device/wifi/status", timeout=_TIMEOUT_DM_FAST)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("wifi_status", _run())
 
 
@@ -1757,6 +2164,7 @@ async def wifi_forget(ssid: str, agent_role: str = "") -> str:
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_post(
             "/api/device/wifi/forget",
@@ -1764,6 +2172,7 @@ async def wifi_forget(ssid: str, agent_role: str = "") -> str:
             timeout=_TIMEOUT_DM_CONFIGURE,
         )
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("wifi_forget", _run())
 
 
@@ -1772,9 +2181,11 @@ async def device_cleanup(agent_role: str = "") -> str:
     perm = _check_device_permission(agent_role)
     if perm:
         return json.dumps({"ok": False, "error": perm}, ensure_ascii=False)
+
     async def _run():
         result = await _dm_post("/api/device/cleanup", timeout=_TIMEOUT_DM_CLEANUP)
         return json.dumps(result, ensure_ascii=False)
+
     return await _guarded_call("device_cleanup", _run())
 
 
@@ -1818,7 +2229,6 @@ h1 { font-size:22px; font-weight:600; color:#1a1a1a; margin-bottom:8px; }
 .refresh-btn:hover { background:#1565c0; }
 .retry-hint { font-size:13px; color:#999; margin-top:8px; }
 """
-
 
 
 _BOUND_STATUS = """\
@@ -1932,6 +2342,7 @@ async def _serve_bind_qr(scope, receive, send):
 
         if qr_url:
             import qrcode as _qrlib
+
             _qr = _qrlib.QRCode(box_size=8, border=2)
             _qr.add_data(qr_url)
             _qr.make(fit=True)
@@ -2052,7 +2463,7 @@ async def _serve_bind_qr(scope, receive, send):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-{f'  <meta http-equiv="refresh" content="{refresh_sec}">' if refresh_sec is not None else ''}
+{f'  <meta http-equiv="refresh" content="{refresh_sec}">' if refresh_sec is not None else ""}
 <title>绑定 AI 教学助手</title>
 <style>{_STATUS_CSS}
 .rebind-warn {{ margin-top:24px; padding-top:16px; border-top:2px solid #ffcdd2; }}
@@ -2076,7 +2487,7 @@ async def _serve_bind_qr(scope, receive, send):
 
   {body_html}
 
-  {f'<div><a href="/bind-qr" class="refresh-btn">⟳ 刷新页面</a></div>' if refresh_sec is not None else ''}
+  {'<div><a href="/bind-qr" class="refresh-btn">⟳ 刷新页面</a></div>' if refresh_sec is not None else ""}
   <p class="footer">首次绑定后即可通过微信与 AI 家庭教师对话</p>
 </div>
 </body>
@@ -2097,34 +2508,52 @@ async def _serve_source_file(scope, receive, send):
       HA 通过微信发送 /sources/{trace_id}_{filename} 时，需要 HTTP 服务返回原文件.
     """
     path = scope.get("path", "")
-    filename = path[len("/sources/"):]
+    filename = path[len("/sources/") :]
     if not filename or ".." in filename or "/" in filename:
-        body = b"{\"error\":\"invalid path\"}"
-        await send({"type": "http.response.start", "status": 400,
-                     "headers": [(b"content-type", b"application/json")]})
+        body = b'{"error":"invalid path"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 400,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
         await send({"type": "http.response.body", "body": body})
         return
 
     filepath = os.path.join(SOURCES_DIR, filename)
     if not os.path.isfile(filepath):
-        body = b"{\"error\":\"file not found\"}"
-        await send({"type": "http.response.start", "status": 404,
-                     "headers": [(b"content-type", b"application/json")]})
+        body = b'{"error":"file not found"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 404,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
         await send({"type": "http.response.body", "body": body})
         return
 
     import mimetypes
+
     content_type, _ = mimetypes.guess_type(filename)
-    headers = [(b"content-type", (content_type or "application/octet-stream").encode()),
-               (b"cache-control", b"private, max-age=3600")]
+    headers = [
+        (b"content-type", (content_type or "application/octet-stream").encode()),
+        (b"cache-control", b"private, max-age=3600"),
+    ]
 
     try:
         with open(filepath, "rb") as f:
             data = f.read()
     except OSError as e:
         body = json.dumps({"error": str(e)}).encode()
-        await send({"type": "http.response.start", "status": 500,
-                     "headers": [(b"content-type", b"application/json")]})
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 500,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
         await send({"type": "http.response.body", "body": body})
         return
 
@@ -2137,24 +2566,32 @@ async def _health_check(scope, receive, send):
     dt_cb = _dt_circuit.status()
     plat_cb = _platform_circuit.status()
     dm_cb = _dm_circuit.status()
-    body = json.dumps({
-        "status": "ok",
-        "service": "platform_mcp",
-        "tools_registered": len(_TOOL_DESCRIPTIONS),
-        "scene": _scene,
-        "slow_queue_pending": _slow_pending,
-        "circuit_breakers": {
-            "deeptutor": {"state": dt_cb["state"], "failure_count": dt_cb["failure_count"]},
-            "platform": {"state": plat_cb["state"], "failure_count": plat_cb["failure_count"]},
-            "device_manager": {"state": dm_cb["state"], "failure_count": dm_cb["failure_count"]},
+    body = json.dumps(
+        {
+            "status": "ok",
+            "service": "platform_mcp",
+            "tools_registered": len(_TOOL_DESCRIPTIONS),
+            "scene": _scene,
+            "slow_queue_pending": _slow_pending,
+            "circuit_breakers": {
+                "deeptutor": {"state": dt_cb["state"], "failure_count": dt_cb["failure_count"]},
+                "platform": {"state": plat_cb["state"], "failure_count": plat_cb["failure_count"]},
+                "device_manager": {
+                    "state": dm_cb["state"],
+                    "failure_count": dm_cb["failure_count"],
+                },
+            },
         },
-    }, ensure_ascii=False).encode()
+        ensure_ascii=False,
+    ).encode()
 
-    await send({
-        "type": "http.response.start",
-        "status": 200,
-        "headers": [(b"content-type", b"application/json")],
-    })
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
     await send({"type": "http.response.body", "body": body})
 
 
@@ -2171,8 +2608,9 @@ async def _proxy_json_post(scope, receive, send, target_url: str):
             return
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(target_url, content=body_bytes or None,
-                                     headers={"content-type": "application/json"})
+            resp = await client.post(
+                target_url, content=body_bytes or None, headers={"content-type": "application/json"}
+            )
             resp_body = resp.content
             status = resp.status_code
     except Exception as e:
@@ -2189,6 +2627,7 @@ async def _proxy_json_post(scope, receive, send, target_url: str):
 # ═══════════════════════════════════════════════
 # Entry point — called by entry.py
 # ═══════════════════════════════════════════════
+
 
 def _build_app():
     """构建带 health + /sources/ 包装的 ASGI app.
@@ -2288,11 +2727,13 @@ async def _handle_mcp_post(scope, receive, send, raw_app):
                                 (b"content-type", b"application/json"),
                                 (b"content-length", str(len(modified)).encode()),
                             ]
-                            await send({
-                                "type": "http.response.start",
-                                "status": 200,
-                                "headers": hdr,
-                            })
+                            await send(
+                                {
+                                    "type": "http.response.start",
+                                    "status": 200,
+                                    "headers": hdr,
+                                }
+                            )
                             await send({"type": "http.response.body", "body": modified})
                             return
                     except (json.JSONDecodeError, Exception):
@@ -2323,6 +2764,7 @@ def _start_mdns(port: int = 8003):
       2. zeroconf 兜底 — 纯 Python, 注册宿主机 IP (桥接模式仍有意义)
     """
     import threading
+
     hostname = _MDNS_HOSTNAME
     host_ip = _get_device_ip()
 
@@ -2334,12 +2776,16 @@ def _start_mdns(port: int = 8003):
         while True:
             try:
                 proc = subprocess.Popen(
-                    ["avahi-publish-service",
-                     "-H", f"{hostname}.local",
-                     "-s", "AI Tutor",
-                     "_http._tcp",
-                     str(port),
-                     "path=/"],
+                    [
+                        "avahi-publish-service",
+                        "-H",
+                        f"{hostname}.local",
+                        "-s",
+                        "AI Tutor",
+                        "_http._tcp",
+                        str(port),
+                        "path=/",
+                    ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -2350,7 +2796,8 @@ def _start_mdns(port: int = 8003):
 
                 logger.info(
                     "mDNS (avahi): http://%s.local:%d/bind-qr  (全 LAN 可见)",
-                    hostname, port,
+                    hostname,
+                    port,
                 )
                 proc.wait()  # 阻塞直到进程退出
                 logger.warning("avahi-publish 进程已退出, 5s 后重启...")
@@ -2367,7 +2814,7 @@ def _start_mdns(port: int = 8003):
         import socket as _socket
 
         try:
-            from zeroconf import Zeroconf, ServiceInfo
+            from zeroconf import ServiceInfo, Zeroconf
         except ImportError:
             logger.warning("zeroconf 未安装, mDNS 仅依赖 avahi")
             return
@@ -2394,7 +2841,9 @@ def _start_mdns(port: int = 8003):
             ip_hint = f"IP={host_ip}" if addresses else "接口自动"
             logger.info(
                 "mDNS (zeroconf): http://%s.local:%d/bind-qr  (%s)",
-                hostname, port, ip_hint,
+                hostname,
+                port,
+                ip_hint,
             )
         except Exception as e:
             logger.warning("zeroconf 注册失败: %s", e)
@@ -2418,6 +2867,7 @@ if not os.environ.get("_MCP_DISABLE_MDNS") and not os.environ.get("_MCP_MDNS_STA
 
 def run_mcp_server(port: int = 8003):
     import uvicorn
+
     if not os.environ.get("_MCP_MDNS_STARTED"):
         os.environ["_MCP_MDNS_STARTED"] = "1"
         _start_mdns(port)

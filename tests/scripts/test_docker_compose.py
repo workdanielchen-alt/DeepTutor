@@ -76,7 +76,7 @@ def test_compose_files_do_not_consume_legacy_env_names() -> None:
 def test_dockerfile_uses_runtime_auth_placeholder() -> None:
     root = Path(__file__).resolve().parents[2]
     content = (root / "Dockerfile").read_text(encoding="utf-8")
-    assert "__NEXT_PUBLIC_API_BASE_PLACEHOLDER__" in content
-    assert "__NEXT_PUBLIC_AUTH_ENABLED_PLACEHOLDER__" in content
+    assert "ARG NEXT_PUBLIC_API_BASE=" in content
+    assert "ARG NEXT_PUBLIC_AUTH_ENABLED=" in content
     assert "DEEPTUTOR_IGNORE_PROCESS_ENV_OVERRIDES=1" in content
     assert 'unset "$key"' in content

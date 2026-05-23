@@ -397,4 +397,4 @@ exclude_dirs = ["tests", "scripts"]
 # B501=request_with_no_cert_validation (opt-in via env var for dev/testing)
 # B603=subprocess_without_shell_equals_true (controlled execution)
 # B202=tarfile_unsafe_members (already using safe_members filter)
-skips = ["B101", "B311", "B403", "B404", "B110", "B104", "B112", "B105", "B301", "B501", "B603", "B202"]
+skips = ["B101", "B311", "B403", "B404", "B110", "B112", "B301", "B501", "B603", "B202"]

@@ -10,38 +10,53 @@ platform/provider_api.py — Provider API (v7.0, 从 hermes_ingest 合并)
 import asyncio
 import atexit
 import base64
+from datetime import datetime, timedelta, timezone
 import glob
 import json
 import logging
 import os
+from pathlib import Path
 import random
 import re
 import struct
 import subprocess
 import sys
 import time
+import typing
 import uuid
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+
+if typing.TYPE_CHECKING:
+    import websockets
 
 sys.path.insert(0, "/tutor_platform")
 sys.path.insert(0, "/")
 
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import Response
+import httpx
+from markitdown import MarkItDown
 from pydantic import BaseModel
 import uvicorn
-import httpx
 
-from markitdown import MarkItDown
-
-from tutor_platform.unified_provider import UnifiedLocalProvider, get_provider_instance, reset_provider_instance
-from tutor_platform.storage import validate_provider_config
 from domains.tutoring.mastery import (
-    get_mastery, get_wrong_answers, update_mastery, weak_points, get_report,
-    generate_parent_report, generate_daily_report, get_due_reviews, schedule_review, _load,
-    get_weekly_stats, get_monthly_stats, get_answer_history,
+    _load,
+    generate_daily_report,
+    generate_parent_report,
+    get_answer_history,
+    get_due_reviews,
+    get_mastery,
+    get_monthly_stats,
+    get_weekly_stats,
+    get_wrong_answers,
+    schedule_review,
+    update_mastery,
+    weak_points,
+)
+from tutor_platform.storage import validate_provider_config
+from tutor_platform.unified_provider import (
+    UnifiedLocalProvider,
+    get_provider_instance,
+    reset_provider_instance,
 )
 
 # ── Phase B: MCP Server merge ──
@@ -49,12 +64,15 @@ from domains.tutoring.mastery import (
 # we call _start_mdns manually from lifespan with the merged :8100 port.
 os.environ["_MCP_MDNS_STARTED"] = "1"
 from mcp_server import (
-    mcp as mcp_fastmcp,
+    _DEVICE_IP,
+    _MDNS_HOSTNAME,
+    _handle_mcp_post,
+    _serve_source_file,
     _set_direct_mode,
     _start_mdns,
-    _serve_source_file,
-    _handle_mcp_post,
-    _MDNS_HOSTNAME,
+)
+from mcp_server import (
+    mcp as mcp_fastmcp,
 )
 
 logger = logging.getLogger("provider_api")
@@ -71,12 +89,16 @@ def _ws_is_alive(ws) -> bool:
         return not ws.closed
     except AttributeError:
         import websockets.protocol
+
         return ws.state is websockets.protocol.State.OPEN
+
 
 HERMES_AGENT_URL = os.getenv("HERMES_AGENT_URL", "http://hermes_agent:8004")
 DEEPTUTOR_URL = os.getenv("DEEPTUTOR_API_URL", "http://deeptutor:8001")
 UPLOADS_DIR = os.getenv("UPLOADS_DIR", "/data/uploads")
 SOURCES_DIR = os.getenv("SOURCES_DIR", "/data/sources")
+
+_dm_process: subprocess.Popen | None = None
 
 _provider_init_time: float = 0.0
 _provider_error: str | None = None
@@ -111,17 +133,19 @@ _MAX_WS_SESSIONS = 100  # 最大并发 WS 连接数
 
 class _DTTutorSession:
     """Persistent DT TutorBot WS connection per learner, with auto-reconnect."""
-    _sessions: dict[str, '_DTTutorSession'] = {}
+
+    _sessions: dict[str, "_DTTutorSession"] = {}
     _lock = asyncio.Lock()
 
     def __init__(self, learner_id: str):
         self.learner_id = learner_id
-        self.ws: 'websockets.WebSocketClientProtocol | None' = None
+        self.ws: "websockets.WebSocketClientProtocol | None" = None
         self.last_used: float = time.time()
         self._ws_lock = asyncio.Lock()
 
     async def send_and_recv(self, payload: str, trace_id: str) -> dict:
         import websockets
+
         self.last_used = time.time()
         try:
             ws = await self._ensure_ws()
@@ -136,6 +160,7 @@ class _DTTutorSession:
         if self.ws is not None and _ws_is_alive(self.ws):
             return self.ws
         import websockets
+
         self.ws = await asyncio.wait_for(
             websockets.connect("ws://deeptutor:8001/api/v1/tutorbot/teacher/ws", close_timeout=10),
             timeout=30,
@@ -143,7 +168,6 @@ class _DTTutorSession:
         return self.ws
 
     async def _do_send_recv(self, ws, payload: str, trace_id: str) -> dict:
-        import websockets
         await asyncio.wait_for(
             ws.send(json.dumps({"content": payload, "chat_id": self.learner_id})),
             timeout=30,
@@ -169,7 +193,7 @@ class _DTTutorSession:
         if not final_content and proactive_content:
             final_content = proactive_content
         if final_content:
-            _qn_m = re.search(r'第\s*(\d+)\s*题', final_content)
+            _qn_m = re.search(r"第\s*(\d+)\s*题", final_content)
             if _qn_m:
                 _last_question_num[self.learner_id] = int(_qn_m.group(1))
             logger.info("[%s] TutorBot: %s", trace_id, final_content[:300])
@@ -199,14 +223,15 @@ class _DTTutorSession:
         await self._close_ws()
 
     @classmethod
-    async def get(cls, learner_id: str) -> '_DTTutorSession':
+    async def get(cls, learner_id: str) -> "_DTTutorSession":
         async with cls._lock:
             if learner_id not in cls._sessions:
                 # 超过上限时踢掉最久未使用的
                 if len(cls._sessions) >= _MAX_WS_SESSIONS:
                     oldest = min(cls._sessions.items(), key=lambda x: x[1].last_used)
-                    logger.warning("[dt_session] Capacity %d reached, evicting %s",
-                                   _MAX_WS_SESSIONS, oldest[0])
+                    logger.warning(
+                        "[dt_session] Capacity %d reached, evicting %s", _MAX_WS_SESSIONS, oldest[0]
+                    )
                     await oldest[1].close()
                     del cls._sessions[oldest[0]]
                 cls._sessions[learner_id] = cls(learner_id)
@@ -226,8 +251,11 @@ async def _dt_session_cleanup_loop():
         await asyncio.sleep(300)
         now = time.time()
         async with _DTTutorSession._lock:
-            idle = [sid for sid, sess in _DTTutorSession._sessions.items()
-                    if now - sess.last_used > 1800]
+            idle = [
+                sid
+                for sid, sess in _DTTutorSession._sessions.items()
+                if now - sess.last_used > 1800
+            ]
             for sid in idle:
                 await _DTTutorSession._sessions[sid].close()
                 del _DTTutorSession._sessions[sid]
@@ -266,15 +294,18 @@ def _save_ocr_warmed():
     except OSError:
         pass
 
+
 # Last SOUL.md content per learner: skip redundant updates when unchanged.
 _last_soul_content: dict[str, str] = {}
 
 _CONTEXT_PERSIST_DIR = os.getenv("MASTERY_DIR", "/data/mastery")
 
+
 def _persist_path(learner_id: str) -> str:
     # URL-safe base64 编码避免文件系统路径冲突
     safe = base64.urlsafe_b64encode(learner_id.encode("utf-8")).decode("ascii")
     return os.path.join(_CONTEXT_PERSIST_DIR, f"{safe}_session.json")
+
 
 def _save_context_to_disk(learner_id: str):
     """持久化教学上下文到 JSON 文件, 容器重启后恢复."""
@@ -286,10 +317,19 @@ def _save_context_to_disk(learner_id: str):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"learner_id": learner_id, "context": ctx, "question_num": qnum,
-                       "updated_at": time.time()}, f, ensure_ascii=False)
+            json.dump(
+                {
+                    "learner_id": learner_id,
+                    "context": ctx,
+                    "question_num": qnum,
+                    "updated_at": time.time(),
+                },
+                f,
+                ensure_ascii=False,
+            )
     except OSError as e:
         logger.warning("Failed to persist context for %s: %s", learner_id, e)
+
 
 def _load_context_from_disk(learner_id: str) -> tuple[str, int]:
     """从磁盘恢复教学上下文."""
@@ -300,6 +340,7 @@ def _load_context_from_disk(learner_id: str) -> tuple[str, int]:
         return data.get("context", ""), data.get("question_num", 0)
     except (FileNotFoundError, json.JSONDecodeError):
         return "", 0
+
 
 async def _switch_dt_profile(profile_id: str, model_id: str, trace_id: str) -> bool:
     """Switch DT's active LLM profile via GET+PUT /api/settings/catalog.
@@ -315,7 +356,9 @@ async def _switch_dt_profile(profile_id: str, model_id: str, trace_id: str) -> b
             catalog_wrapper = resp.json()
             catalog = catalog_wrapper.get("catalog", catalog_wrapper)
             if "services" not in catalog or "llm" not in catalog["services"]:
-                logger.warning("[%s] _switch_dt_profile bad catalog: %s", trace_id, list(catalog.keys()))
+                logger.warning(
+                    "[%s] _switch_dt_profile bad catalog: %s", trace_id, list(catalog.keys())
+                )
                 return False
             catalog["services"]["llm"]["active_profile_id"] = profile_id
             catalog["services"]["llm"]["active_model_id"] = model_id
@@ -358,12 +401,28 @@ async def _get_provider() -> UnifiedLocalProvider:
         return await _init_provider()
 
 
-ALLOWED_EXTENSIONS = frozenset({
-    ".pdf", ".docx", ".doc", ".pptx", ".ppt",
-    ".txt", ".md", ".html", ".htm", ".rst",
-    ".xlsx", ".xls", ".csv",
-    ".jpg", ".jpeg", ".png", ".webp", ".bmp",
-})
+ALLOWED_EXTENSIONS = frozenset(
+    {
+        ".pdf",
+        ".docx",
+        ".doc",
+        ".pptx",
+        ".ppt",
+        ".txt",
+        ".md",
+        ".html",
+        ".htm",
+        ".rst",
+        ".xlsx",
+        ".xls",
+        ".csv",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".bmp",
+    }
+)
 MAX_FILE_SIZE = 100 * 1024 * 1024
 
 
@@ -374,13 +433,14 @@ def _sanitize_html_content(html: str) -> str:
     to prevent XSS when content is displayed in any web context.
     """
     import re as _re
-    cleaned = _re.sub(r'<script[^>]*>.*?</script>', '', html, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r'<style[^>]*>.*?</style>', '', cleaned, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r'<iframe[^>]*>.*?</iframe>', '', cleaned, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r'<object[^>]*>.*?</object>', '', cleaned, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r'<embed[^>]*>.*?</embed>', '', cleaned, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r'\s+on\w+\s*=\s*["\'][^"\']*["\']', '', cleaned, flags=_re.IGNORECASE)
-    cleaned = _re.sub(r'\s+on\w+\s*=\s*\S+', '', cleaned, flags=_re.IGNORECASE)
+
+    cleaned = _re.sub(r"<script[^>]*>.*?</script>", "", html, flags=_re.DOTALL | _re.IGNORECASE)
+    cleaned = _re.sub(r"<style[^>]*>.*?</style>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
+    cleaned = _re.sub(r"<iframe[^>]*>.*?</iframe>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
+    cleaned = _re.sub(r"<object[^>]*>.*?</object>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
+    cleaned = _re.sub(r"<embed[^>]*>.*?</embed>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
+    cleaned = _re.sub(r'\s+on\w+\s*=\s*["\'][^"\']*["\']', "", cleaned, flags=_re.IGNORECASE)
+    cleaned = _re.sub(r"\s+on\w+\s*=\s*\S+", "", cleaned, flags=_re.IGNORECASE)
     return cleaned
 
 
@@ -393,19 +453,93 @@ def _validate_file(filename: str | None, size: int) -> str | None:
     return None
 
 
-_EDUCATIONAL_KEYWORDS = frozenset({
-    "题", "分", "解", "方程", "计算", "证明", "化简", "求值", "判断",
-    "选择", "填空", "解答", "应用", "阅读", "理解", "分析", "论述",
-    "实验", "观察", "归纳", "推理", "论证", "求解", "画", "列出",
-    "写出", "找出", "确定", "比较", "分类", "概括", "解释", "说明",
-    "练习", "测试", "考试", "作业", "试卷", "答题", "得分", "评卷",
-    "知识点", "考点", "公式", "定理", "定义", "法则", "性质",
-    "class", "exercise", "homework", "exam", "test", "quiz",
-    "calculate", "prove", "solve", "equation", "function", "graph",
-    "一、", "二、", "三、", "1.", "①", "考点", "单元", "学期",
-    "年级", "科目", "数学", "语文", "英语", "物理", "化学", "生物",
-    "政治", "历史", "地理", "科学", "algebra", "geometry", "physics",
-})
+_EDUCATIONAL_KEYWORDS = frozenset(
+    {
+        "题",
+        "分",
+        "解",
+        "方程",
+        "计算",
+        "证明",
+        "化简",
+        "求值",
+        "判断",
+        "选择",
+        "填空",
+        "解答",
+        "应用",
+        "阅读",
+        "理解",
+        "分析",
+        "论述",
+        "实验",
+        "观察",
+        "归纳",
+        "推理",
+        "论证",
+        "求解",
+        "画",
+        "列出",
+        "写出",
+        "找出",
+        "确定",
+        "比较",
+        "分类",
+        "概括",
+        "解释",
+        "说明",
+        "练习",
+        "测试",
+        "考试",
+        "作业",
+        "试卷",
+        "答题",
+        "得分",
+        "评卷",
+        "知识点",
+        "考点",
+        "公式",
+        "定理",
+        "定义",
+        "法则",
+        "性质",
+        "class",
+        "exercise",
+        "homework",
+        "exam",
+        "test",
+        "quiz",
+        "calculate",
+        "prove",
+        "solve",
+        "equation",
+        "function",
+        "graph",
+        "一、",
+        "二、",
+        "三、",
+        "1.",
+        "①",
+        "考点",
+        "单元",
+        "学期",
+        "年级",
+        "科目",
+        "数学",
+        "语文",
+        "英语",
+        "物理",
+        "化学",
+        "生物",
+        "政治",
+        "历史",
+        "地理",
+        "科学",
+        "algebra",
+        "geometry",
+        "physics",
+    }
+)
 
 
 def _is_educational_content(text: str, min_chars: int = 20) -> bool:
@@ -422,12 +556,12 @@ def _is_educational_content(text: str, min_chars: int = 20) -> bool:
     if hits >= 2:
         return True
     # 试卷格式特征: 编号+题号 或 分数标注
-    if re.search(r'(?:^|\n)\s*(?:一|二|三|四|五|六)\.\s*(?:选择|填空|判断|解答|计算)', text):
+    if re.search(r"(?:^|\n)\s*(?:一|二|三|四|五|六)\.\s*(?:选择|填空|判断|解答|计算)", text):
         return True
-    if re.search(r'[（(]\s*[1-9]\d*\s*分\s*[)）]', text):
+    if re.search(r"[（(]\s*[1-9]\d*\s*分\s*[)）]", text):
         return True
     # 数学符号密集型文本
-    math_symbols = sum(1 for ch in text if ch in '=×÷±√∞∫πΔ²³∑∏')
+    math_symbols = sum(1 for ch in text if ch in "=×÷±√∞∫πΔ²³∑∏")
     if len(text) > 50 and math_symbols / len(text) > 0.02:
         return True
     return False
@@ -465,9 +599,13 @@ async def _warm_ocr_model(trace_id: str = ""):
             resp = await client.post(f"{rkllama_url}/v1/warm/deepseekocr-3b")
             if resp.status_code == 200:
                 data = resp.json()
-                logger.info("[%s] OCR warm: %s (loaded=%s, %.0fms)",
-                            trace_id, data.get("display", "?"),
-                            data.get("loaded"), data.get("warm_ms", 0))
+                logger.info(
+                    "[%s] OCR warm: %s (loaded=%s, %.0fms)",
+                    trace_id,
+                    data.get("display", "?"),
+                    data.get("loaded"),
+                    data.get("warm_ms", 0),
+                )
             else:
                 logger.debug("[%s] OCR warm skipped (HTTP %s)", trace_id, resp.status_code)
     except Exception as e:
@@ -511,19 +649,24 @@ async def _handle_inbound_file(
         if ext in _IMAGE_EXTENSIONS:
             content = await _ocr_image_file(file_path, trace_id)
             if content:
-                logger.info("[%s] OCR success: %d chars from %s",
-                            trace_id, len(content), file_path)
+                logger.info("[%s] OCR success: %d chars from %s", trace_id, len(content), file_path)
                 return {
-                    "ok": True, "content": content,
-                    "intent": "EDUCATION", "route": "ocr",
+                    "ok": True,
+                    "content": content,
+                    "intent": "EDUCATION",
+                    "route": "ocr",
                     "storage": {"ok": False},
                 }
             # OCR failed — descriptive fallback so DT Bot can guide user
             content = "用户通过微信发送了一张图片，但图片中的文字未能被自动识别。请用友好的语气请学生将题目文字直接输入发送过来。"
-            logger.warning("[%s] OCR failed, using descriptive fallback for %s", trace_id, file_path)
+            logger.warning(
+                "[%s] OCR failed, using descriptive fallback for %s", trace_id, file_path
+            )
             return {
-                "ok": True, "content": content,
-                "intent": "EDUCATION", "route": "ocr_fallback",
+                "ok": True,
+                "content": content,
+                "intent": "EDUCATION",
+                "route": "ocr_fallback",
                 "storage": {"ok": False},
             }
 
@@ -535,20 +678,25 @@ async def _handle_inbound_file(
             if ext in {".html", ".htm"}:
                 content = _sanitize_html_content(content)
             return {
-                "ok": True, "content": content,
+                "ok": True,
+                "content": content,
                 "intent": "EDUCATION" if len(content) < 5000 else "DOCUMENT",
-                "route": "text", "storage": {"ok": False},
+                "route": "text",
+                "storage": {"ok": False},
             }
 
         # ── PDF: classify → text PDF (markitdown) or scanned (render→OCR) ──
         elif ext == ".pdf":
             content = await _handle_pdf(file_path, trace_id)
             if content:
-                logger.info("[%s] PDF extraction: %d chars from %s",
-                            trace_id, len(content), file_path)
+                logger.info(
+                    "[%s] PDF extraction: %d chars from %s", trace_id, len(content), file_path
+                )
                 return {
-                    "ok": True, "content": content,
-                    "intent": "EDUCATION", "route": "document_extract",
+                    "ok": True,
+                    "content": content,
+                    "intent": "EDUCATION",
+                    "route": "document_extract",
                     "storage": {"ok": False},
                 }
             # Fallback to placeholder
@@ -559,11 +707,14 @@ async def _handle_inbound_file(
         elif ext in {".docx", ".pptx", ".ppt", ".xlsx", ".xls"}:
             content = _extract_with_markitdown(file_path)
             if content:
-                logger.info("[%s] markitdown extracted %d chars from %s",
-                            trace_id, len(content), file_path)
+                logger.info(
+                    "[%s] markitdown extracted %d chars from %s", trace_id, len(content), file_path
+                )
                 return {
-                    "ok": True, "content": content,
-                    "intent": "EDUCATION", "route": "document_extract",
+                    "ok": True,
+                    "content": content,
+                    "intent": "EDUCATION",
+                    "route": "document_extract",
                     "storage": {"ok": False},
                 }
             logger.warning("[%s] markitdown failed for %s", trace_id, file_path)
@@ -573,11 +724,14 @@ async def _handle_inbound_file(
         elif ext == ".doc":
             content = _extract_with_antiword(file_path)
             if content:
-                logger.info("[%s] antiword extracted %d chars from %s",
-                            trace_id, len(content), file_path)
+                logger.info(
+                    "[%s] antiword extracted %d chars from %s", trace_id, len(content), file_path
+                )
                 return {
-                    "ok": True, "content": content,
-                    "intent": "EDUCATION", "route": "document_extract",
+                    "ok": True,
+                    "content": content,
+                    "intent": "EDUCATION",
+                    "route": "document_extract",
                     "storage": {"ok": False},
                 }
             logger.warning("[%s] antiword failed for %s", trace_id, file_path)
@@ -602,6 +756,7 @@ def _classify_pdf(file_path: str) -> tuple[str, int]:
     ``"text"`` means at least one page has >50 chars of extractable text.
     """
     import fitz
+
     doc = fitz.open(file_path)
     num_pages = len(doc)
     total_text = 0
@@ -615,6 +770,7 @@ def _classify_pdf(file_path: str) -> tuple[str, int]:
 def _render_pdf_page(file_path: str, page_num: int, dpi: int = 200) -> bytes:
     """Render a PDF page to PNG image bytes."""
     import fitz
+
     doc = fitz.open(file_path)
     page = doc[page_num]
     zoom = dpi / 72
@@ -626,8 +782,9 @@ def _render_pdf_page(file_path: str, page_num: int, dpi: int = 200) -> bytes:
 async def _handle_pdf(file_path: str, trace_id: str) -> str:
     """Classify PDF → route to text extraction or page-by-page OCR."""
     classification, num_pages = _classify_pdf(file_path)
-    logger.info("[%s] PDF classified as '%s' (%d pages, %s)",
-                trace_id, classification, num_pages, file_path)
+    logger.info(
+        "[%s] PDF classified as '%s' (%d pages, %s)", trace_id, classification, num_pages, file_path
+    )
 
     if classification == "text":
         return _extract_with_markitdown(file_path)
@@ -640,7 +797,7 @@ async def _handle_pdf(file_path: str, trace_id: str) -> str:
             processed = _opencv_preprocess_image(img_bytes)
             page_text = await _ocr_image_bytes(processed, trace_id)
             if page_text and page_text.strip():
-                pages_text.append(f"--- Page {i+1} ---\n{page_text.strip()}")
+                pages_text.append(f"--- Page {i + 1} ---\n{page_text.strip()}")
         except Exception as exc:
             logger.warning("[%s] Scanned PDF page %d failed: %s", trace_id, i, exc)
 
@@ -682,15 +839,21 @@ def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
                 center = (w // 2, h // 2)
                 M = cv2.getRotationMatrix2D(center, angle, 1.0)
                 enhanced = cv2.warpAffine(
-                    enhanced, M, (w, h),
+                    enhanced,
+                    M,
+                    (w, h),
                     flags=cv2.INTER_CUBIC,
                     borderMode=cv2.BORDER_REPLICATE,
                 )
 
         # Adaptive threshold (binarize)
         binary = cv2.adaptiveThreshold(
-            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2,
+            enhanced,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            11,
+            2,
         )
 
         _, buffer = cv2.imencode(".jpg", binary, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -706,6 +869,7 @@ def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
 async def _ocr_image_bytes(image_bytes: bytes, trace_id: str) -> str:
     """Send preprocessed image bytes to rkllama OCR."""
     import base64
+
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
     rkllama_url = os.getenv("RKLLAMA_URL", "http://rkllama:8080")
     async with _ocr_semaphore:
@@ -714,8 +878,10 @@ async def _ocr_image_bytes(image_bytes: bytes, trace_id: str) -> str:
                 resp = await client.post(
                     f"{rkllama_url}/v1/ocr",
                     json={
-                        "image": img_b64, "language": "zh",
-                        "return_formulas": False, "return_layout": False,
+                        "image": img_b64,
+                        "language": "zh",
+                        "return_formulas": False,
+                        "return_layout": False,
                     },
                 )
                 if resp.status_code == 200:
@@ -768,7 +934,9 @@ def _extract_with_antiword(file_path: str) -> str:
     try:
         result = subprocess.run(
             ["antiword", file_path],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
@@ -809,20 +977,30 @@ async def _ingest_to_kb(
     try:
         docs = _split_content_for_ingest(content, filename)
         ids = [f"{trace_id}_{i}" for i in range(len(docs))]
-        metadatas = [{
-            "filename": filename,
-            "learner_id": learner_id,
-            "source": source,
-            "trace_id": trace_id,
-        } for _ in docs]
+        metadatas = [
+            {
+                "filename": filename,
+                "learner_id": learner_id,
+                "source": source,
+                "trace_id": trace_id,
+            }
+            for _ in docs
+        ]
 
         await asyncio.to_thread(
             provider.add_documents,
-            kb_name=kb_name, documents=docs,
-            metadatas=metadatas, ids=ids,
+            kb_name=kb_name,
+            documents=docs,
+            metadatas=metadatas,
+            ids=ids,
         )
-        logger.info("[%s] KB ingest: %d chunks -> %s (%d chars total)",
-                    trace_id, len(docs), kb_name, len(content))
+        logger.info(
+            "[%s] KB ingest: %d chunks -> %s (%d chars total)",
+            trace_id,
+            len(docs),
+            kb_name,
+            len(content),
+        )
     except Exception as exc:
         logger.warning("[%s] KB ingest error for %s: %s", trace_id, filename, exc)
 
@@ -830,9 +1008,13 @@ async def _ingest_to_kb(
     tmp_path = None
     try:
         import tempfile
+
         tmp = tempfile.NamedTemporaryFile(
-            suffix=".txt", mode="w", delete=False,
-            encoding="utf-8", prefix=f"auto_teach_{trace_id}_",
+            suffix=".txt",
+            mode="w",
+            delete=False,
+            encoding="utf-8",
+            prefix=f"auto_teach_{trace_id}_",
         )
         try:
             tmp.write(content)
@@ -866,7 +1048,9 @@ async def _ingest_to_kb(
             if resp.status_code in (200, 201):
                 logger.info("[%s] DT index sync: OK -> %s (%s)", trace_id, kb_name, filename)
             else:
-                logger.warning("[%s] DT index sync: %d %s", trace_id, resp.status_code, resp.text[:200])
+                logger.warning(
+                    "[%s] DT index sync: %d %s", trace_id, resp.status_code, resp.text[:200]
+                )
     except Exception as exc:
         logger.warning("[%s] DT index sync error: %s", trace_id, exc)
     finally:
@@ -886,6 +1070,7 @@ def _split_content_for_ingest(content: str, filename: str, chunk_size: int = 500
         return [content]
 
     import re
+
     chunks: list[str] = []
     # Try splitting at double newlines first (paragraphs)
     paragraphs = re.split(r"\n\s*\n", content)
@@ -908,7 +1093,7 @@ def _split_content_for_ingest(content: str, filename: str, chunk_size: int = 500
                 final.append(c)
             else:
                 for i in range(0, len(c), chunk_size):
-                    final.append(c[i:i + chunk_size])
+                    final.append(c[i : i + chunk_size])
         return final
 
     return chunks if chunks else [content]
@@ -1036,7 +1221,11 @@ async def _sync_quiz_with_retry(
             except Exception as e:
                 logger.warning(
                     "[sync_quiz] retry %d/%d: %s/%s: %s",
-                    attempt + 1, max_retries, learner_id, topic, e,
+                    attempt + 1,
+                    max_retries,
+                    learner_id,
+                    topic,
+                    e,
                 )
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)
@@ -1044,7 +1233,11 @@ async def _sync_quiz_with_retry(
                     failed += 1
     logger.info(
         "[sync_quiz] trace=%s learner=%s synced=%d failed=%d total=%d",
-        trace_id, learner_id, synced, failed, len(results),
+        trace_id,
+        learner_id,
+        synced,
+        failed,
+        len(results),
     )
     return {"ok": failed == 0, "synced": synced, "failed": failed, "total": len(results)}
 
@@ -1077,7 +1270,8 @@ async def _session_cleanup_loop():
 
             logger.info(
                 "[cleanup] Next session cleanup at +%.0f seconds (%.1f hours)",
-                wait, wait / 3600,
+                wait,
+                wait / 3600,
             )
             await asyncio.sleep(wait)
 
@@ -1086,12 +1280,14 @@ async def _session_cleanup_loop():
             if _session_msg_since_cleanup < SESSION_CLEANUP_THRESHOLD:
                 logger.info(
                     "[cleanup] Skipping — %d tutor_chat calls since last cleanup < threshold %d",
-                    _session_msg_since_cleanup, SESSION_CLEANUP_THRESHOLD,
+                    _session_msg_since_cleanup,
+                    SESSION_CLEANUP_THRESHOLD,
                 )
                 continue
 
             import websockets
-            ws_url = f"ws://deeptutor:8001/api/v1/tutorbot/teacher/ws"
+
+            ws_url = "ws://deeptutor:8001/api/v1/tutorbot/teacher/ws"
             ws = await asyncio.wait_for(
                 websockets.connect(ws_url, close_timeout=5),
                 timeout=15,
@@ -1151,6 +1347,7 @@ async def lifespan(app: FastAPI):
 
     try:
         from tutor_platform.ingest_status import IngestStatusTracker
+
         orphans = IngestStatusTracker.get_orphaned()
         if orphans:
             logger.warning(
@@ -1160,15 +1357,30 @@ async def lifespan(app: FastAPI):
             for o in orphans[:5]:
                 logger.warning(
                     "  orphan: %s stage=%s age=%.0fs",
-                    o.get("trace_id"), o.get("stage"),
+                    o.get("trace_id"),
+                    o.get("stage"),
                     time.time() - o.get("ts", 0),
                 )
                 IngestStatusTracker.mark(
-                    o["trace_id"], "orphaned_on_restart",
+                    o["trace_id"],
+                    "orphaned_on_restart",
                     {"prev_stage": o.get("stage")},
                 )
     except Exception:
         logger.debug("Orphan scan skipped", exc_info=True)
+
+    # ── Start Device Manager API subprocess (port 8101) ──
+    global _dm_process
+    try:
+        dm_port = os.getenv("DEVICE_MANAGER_PORT", "8101")
+        _dm_process = subprocess.Popen(
+            [sys.executable, "/app/device_manager_api.py"],
+            env={**os.environ, "DEVICE_MANAGER_PORT": dm_port},
+            stdout=subprocess.DEVNULL,
+        )
+        logger.info("Device Manager API started on port %s (pid %d)", dm_port, _dm_process.pid)
+    except Exception as e:
+        logger.warning("Device Manager API start failed: %s", e)
 
     yield
     cleanup_task.cancel()
@@ -1192,6 +1404,21 @@ async def lifespan(app: FastAPI):
         logger.info("Provider reset")
     except Exception as e:
         logger.warning("Provider reset error: %s", e)
+
+    # ── Stop Device Manager API subprocess ──
+    if _dm_process is not None:
+        try:
+            _dm_process.terminate()
+            _dm_process.wait(timeout=5)
+            logger.info("Device Manager API stopped")
+        except Exception as e:
+            logger.warning("Device Manager API stop error: %s", e)
+            try:
+                _dm_process.kill()
+            except Exception:
+                pass
+        finally:
+            _dm_process = None
 
 
 app = FastAPI(title="Platform API", version="7.0.0", lifespan=lifespan)
@@ -1236,6 +1463,7 @@ async def _stop_mcp_lifespan(receive_queue):
 # and forward directly to the initialized FastMCP ASGI app.
 class _MCPASGIMiddleware:
     """Route /mcp* requests directly to FastMCP ASGI app."""
+
     def __init__(self, app):
         self.app = app
 
@@ -1261,57 +1489,159 @@ app.mount("/sources", _serve_source_file)
 # Minimal bind-qr bootstrap page (Phase B: no self-calls, client-side JS fetches QR)
 _BIND_QR_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
 <title>绑定 AI 教学助手</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f5f5;display:flex;justify-content:center;padding:20px}
 .container{max-width:400px;width:100%}
-h1{font-size:20px;text-align:center;margin:20px 0 12px;color:#333}
-.status{background:#fff;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 1px 4px rgba(0,0,0,.08)}
-.status-row{display:flex;justify-content:space-between;padding:6px 0;font-size:14px}
-.label{color:#888}.value{font-weight:600}
-.ok{color:#2e7d32}.warn{color:#e65100}.err{color:#c62828}
-.qr-wrapper{text-align:center;margin:16px 0}
-.qr{max-width:280px;border-radius:8px}
-.footer{text-align:center;font-size:12px;color:#999;margin:20px 0}
-#qr-img{display:none}.loading{text-align:center;color:#888;font-size:14px;padding:40px 0}
+.card{background:#fff;border-radius:12px;padding:24px 20px;margin:12px 0;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center}
+h1{font-size:20px;margin:24px 0 8px;color:#333;text-align:center;font-weight:600}
+.qr-img{max-width:260px;width:100%;height:auto;border-radius:8px;margin:12px auto;display:block}
+.hint{font-size:14px;color:#555;margin:12px 0 4px;line-height:1.5}
+.countdown{font-size:12px;color:#999;margin:4px 0}
+.status-text{font-size:14px;color:#333;margin:8px 0}
+.loading{color:#888;font-size:15px;padding:50px 0;text-align:center}
+.bound-icon{font-size:48px;margin:8px 0;color:#2e7d32}
+.warn-icon{font-size:48px;margin:8px 0;color:#e65100}
+.error{color:#c62828;font-size:14px}
+.success{color:#2e7d32;font-size:14px}
+.subtle{color:#999;font-size:12px}
+.footer{text-align:center;font-size:12px;color:#aaa;margin:20px 0;line-height:1.6}
+.info-box{font-size:13px;color:#555;text-align:left;margin:12px 0 0;padding:12px 16px;background:#f8f8f8;border-radius:8px;line-height:1.8}
+.info-box dt{font-weight:600;color:#333;margin-top:6px}
+.info-box dd{margin:0 0 0 16px;color:#666}
+.wifi-tip{color:#e65100;font-size:12px;margin:8px 0 0;text-align:center}
 </style>
 </head>
 <body>
 <div class="container">
-<h1>📚 绑定 AI 教学助手</h1>
-<div class="status" id="status"><div class="loading">正在加载状态...</div></div>
-<div id="qr-section" style="display:none">
-<div class="qr-wrapper"><img id="qr-img" class="qr" alt="QR Code"></div>
-<p class="footer" id="qr-hint"></p>
+<h1>绑定 AI 教学助手</h1>
+<div id="app">
+<div class="card" id="card-status">
+  <div class="loading" id="loading-text">正在加载...</div>
+  <div class="bound-icon" id="bound-icon" style="display:none">&#10003;</div>
+  <div class="warn-icon" id="warn-icon" style="display:none">&#9888;</div>
+  <img id="qr-img" class="qr-img" style="display:none" alt="QR Code">
+  <div class="hint" id="hint"></div>
+  <div class="countdown" id="countdown"></div>
+  <div class="status-text" id="status-text"></div>
+  <div class="info-box" id="info-box" style="display:none">
+    <dl>
+      <dt>设备名称</dt><dd>AI 家庭教师</dd>
+      <dt>第一步</dt><dd>打开微信，与设备对话</dd>
+      <dt>第二步</dt><dd>发送「配置WiFi」设置无线网络</dd>
+    </dl>
+    <p class="wifi-tip">配置 WiFi 后，手机和设备需连<strong>同一 WiFi</strong></p>
+  </div>
 </div>
-<p class="footer">首次绑定后即可通过微信与 AI 家庭教师对话</p>
+</div>
+<p class="footer">首次绑定后即可通过微信与 AI 家庭教师对话<br>支持设备管理、学习报告、WiFi 配置等</p>
 </div>
 <script>
-async function refresh(){try{
-let r=await fetch('/api/bot/qrcode?refresh=1');
-if(r.ok&&r.headers.get('content-type').includes('image/png')){
-let blob=await r.blob();
-document.getElementById('qr-img').src=URL.createObjectURL(blob);
-document.getElementById('qr-img').style.display='block';
-document.getElementById('qr-section').style.display='block';
-document.getElementById('status').innerHTML=
-  '<div class="status-row"><span class="label">系统状态</span><span class="value ok">✓ 运行中</span></div>'+
-  '<div class="status-row"><span class="label">微信服务</span><span class="value ok">✓ 可使用</span></div>';
-document.getElementById('qr-hint').textContent='请使用微信「扫一扫」扫描上方二维码';
-}else{
-document.getElementById('status').innerHTML=
-  '<div class="status-row"><span class="label">系统状态</span><span class="value ok">✓ 运行中</span></div>'+
-  '<div class="status-row"><span class="label">微信服务</span><span class="value warn">⟳ 准备中</span></div>';
-setTimeout(refresh,5000);
-}}catch(e){
-document.getElementById('status').innerHTML=
-  '<div class="status-row"><span class="label">系统状态</span><span class="value err">✗ 启动中</span></div>'+
-  '<div class="status-row"><span class="label">微信服务</span><span class="value err">—</span></div>';
-setTimeout(refresh,10000);
-}}
-refresh();
+var QR_TTL = 60, pollTimer = null;
+function stopPoll(){if(pollTimer){clearTimeout(pollTimer);pollTimer=null}}
+
+async function checkStatus(){
+  try{
+    var r=await fetch('/api/bot/bootstrap_parent/status');
+    var d=await r.json();
+    if(!d.ok){setTimeout(checkStatus,3000);return}
+    if(d.bound){showBound();return}
+    var bs=d.bootstrap||{};
+    if(bs.status==='generating'){
+      showLoading('正在生成二维码...');
+      pollTimer=setTimeout(checkStatus,2000);
+    }else if(bs.status==='qr_ready'&&bs.qr_url){
+      if(bs.qr_expired){startBootstrap();return}
+      showLoading('正在获取二维码...');
+      startBootstrap();
+    }else if(bs.status==='restarting'){
+      showLoading('正在配置设备...');
+      pollTimer=setTimeout(checkStatus,2000);
+    }else if(bs.status==='error'){
+      showError(bs.error||'绑定失败');
+      pollTimer=setTimeout(checkStatus,10000);
+    }else{
+      startBootstrap();
+    }
+  }catch(e){
+    showError('无法连接服务器');
+    pollTimer=setTimeout(checkStatus,5000);
+  }
+}
+
+async function startBootstrap(){
+  showLoading('正在生成二维码...');
+  try{
+    var r=await fetch('/api/bot/bootstrap_parent',{method:'POST'});
+    if(r.headers.get('content-type')&&r.headers.get('content-type').includes('image/png')){
+      var blob=await r.blob();
+      document.getElementById('qr-img').src=URL.createObjectURL(blob);
+      document.getElementById('qr-img').style.display='block';
+      document.getElementById('loading-text').style.display='none';
+      document.getElementById('hint').textContent='请使用微信「扫一扫」扫描上方二维码';
+      document.getElementById('hint').className='hint';
+      var remaining=QR_TTL;
+      var ctxt=document.getElementById('countdown');
+      var timer=setInterval(function(){
+        remaining--;
+        if(remaining<=0){clearInterval(timer);ctxt.textContent='二维码已过期，正在刷新...';startBootstrap()}
+        else ctxt.textContent='二维码有效期 '+remaining+' 秒';
+      },1000);
+      pollBound();
+    }else{
+      var dj=await r.json().catch(function(){return{}});
+      if(dj.bound){showBound();return}
+      showError(dj.error||'生成失败');
+      pollTimer=setTimeout(checkStatus,5000);
+    }
+  }catch(e){
+    showError('请求失败');
+    pollTimer=setTimeout(checkStatus,5000);
+  }
+}
+
+async function pollBound(){
+  try{
+    var r=await fetch('/api/bot/bootstrap_parent/status');
+    var d=await r.json();
+    if(d.bound){stopPoll();showBound();return}
+    pollTimer=setTimeout(pollBound,2500);
+  }catch(e){
+    pollTimer=setTimeout(pollBound,2500);
+  }
+}
+
+function showBound(){
+  stopPoll();
+  document.getElementById('loading-text').style.display='none';
+  document.getElementById('qr-img').style.display='none';
+  document.getElementById('hint').textContent='✓ 已成功绑定';
+  document.getElementById('hint').className='hint success';
+  document.getElementById('bound-icon').style.display='block';
+  document.getElementById('countdown').textContent='';
+  document.getElementById('status-text').textContent='请在微信中发送「配置WiFi」设置无线网络';
+  document.getElementById('info-box').style.display='block';
+}
+
+function showLoading(msg){
+  document.getElementById('loading-text').style.display='block';
+  document.getElementById('loading-text').textContent=msg||'请稍候...';
+  document.getElementById('qr-img').style.display='none';
+  document.getElementById('hint').textContent='';
+  document.getElementById('countdown').textContent='';
+}
+
+function showError(msg){
+  document.getElementById('loading-text').style.display='none';
+  document.getElementById('qr-img').style.display='none';
+  document.getElementById('hint').textContent='⚠ '+msg;
+  document.getElementById('hint').className='hint error';
+  document.getElementById('countdown').textContent='将在数秒后自动重试...';
+}
+
+checkStatus();
 </script>
 </body>
 </html>"""
@@ -1321,6 +1651,7 @@ refresh();
 @app.get("/bind-qr")
 async def bind_qr_page():
     from fastapi.responses import HTMLResponse
+
     return HTMLResponse(_BIND_QR_HTML)
 
 
@@ -1336,6 +1667,7 @@ async def trace_id_middleware(request: Request, call_next):
 @app.get("/api/ingest/status/{trace_id}")
 def api_ingest_status(trace_id: str):
     from tutor_platform.ingest_status import IngestStatusTracker
+
     entry = IngestStatusTracker.get(trace_id)
     if not entry:
         return {"ok": False, "error": "trace_id not found"}
@@ -1366,11 +1698,13 @@ def api_source_by_trace_id(trace_id: str):
         filepath = os.path.join(sources_dir, filename)
         try:
             st = os.stat(filepath)
-            files.append({
-                "filename": filename,
-                "size": st.st_size,
-                "source_url": f"/sources/{filename}",
-            })
+            files.append(
+                {
+                    "filename": filename,
+                    "size": st.st_size,
+                    "source_url": f"/sources/{filename}",
+                }
+            )
         except OSError:
             pass
 
@@ -1384,9 +1718,11 @@ def api_kb_search(query: str = "", kb_name: str = "tutoring", top_k: int = 5):
         return {"ok": False, "error": "query is required"}
     try:
         import chromadb
+
         client = chromadb.PersistentClient(path="/data/chroma")
         try:
             from tutor_platform.tools.embeddings import RkllamaEmbeddingFunction
+
             coll = client.get_collection(
                 kb_name,
                 embedding_function=RkllamaEmbeddingFunction(),
@@ -1399,13 +1735,17 @@ def api_kb_search(query: str = "", kb_name: str = "tutoring", top_k: int = 5):
         distances = results.get("distances", [[]])[0]
         items = []
         for i, doc in enumerate(docs):
-            items.append({
-                "text": doc[:500],
-                "score": round(1.0 - min(float(distances[i]) if i < len(distances) else 0, 1.0), 3),
-                "source": metas[i].get("source", "") if i < len(metas) else "",
-                "learner_id": metas[i].get("learner_id", "") if i < len(metas) else "",
-                "trace_id": metas[i].get("trace_id", "") if i < len(metas) else "",
-            })
+            items.append(
+                {
+                    "text": doc[:500],
+                    "score": round(
+                        1.0 - min(float(distances[i]) if i < len(distances) else 0, 1.0), 3
+                    ),
+                    "source": metas[i].get("source", "") if i < len(metas) else "",
+                    "learner_id": metas[i].get("learner_id", "") if i < len(metas) else "",
+                    "trace_id": metas[i].get("trace_id", "") if i < len(metas) else "",
+                }
+            )
         return {"ok": True, "results": items, "source": "chromadb", "total": len(items)}
     except ImportError:
         return {"ok": False, "error": "chromadb not available"}
@@ -1438,30 +1778,54 @@ async def api_ingest_proxy(
     if learner_id == "default":
         logger.warning("[%s] ingest_proxy called with default learner_id", trace_id)
     from tutor_platform.ingest_status import IngestStatusTracker
-    IngestStatusTracker.mark(trace_id, "processing", {
-        "filename": file.filename or "", "kb_name": kb_name, "source": "web",
-    })
+
+    IngestStatusTracker.mark(
+        trace_id,
+        "processing",
+        {
+            "filename": file.filename or "",
+            "kb_name": kb_name,
+            "source": "web",
+        },
+    )
     provider = await _get_provider()
     result = await _handle_inbound_file(
         file_path=dest,
         metadata={
-            "source": "web", "kb_name": kb_name, "learner_id": learner_id,
-            "trace_id": trace_id, "tool_name": tool_name,
+            "source": "web",
+            "kb_name": kb_name,
+            "learner_id": learner_id,
+            "trace_id": trace_id,
+            "tool_name": tool_name,
         },
     )
-    IngestStatusTracker.mark(trace_id, "completed", {
-        "intent": result.get("intent"), "route": result.get("route"),
-        "storage_ok": result.get("storage", {}).get("ok", False),
-    })
-    asyncio.create_task(_notify_hermes_agent(
-        kb_name=kb_name, filename=os.path.basename(file.filename) if file.filename else "unknown",
-        learner_id=learner_id, result=result,
-        trace_id=trace_id, source_url=source_url,
-    ))
+    IngestStatusTracker.mark(
+        trace_id,
+        "completed",
+        {
+            "intent": result.get("intent"),
+            "route": result.get("route"),
+            "storage_ok": result.get("storage", {}).get("ok", False),
+        },
+    )
+    asyncio.create_task(
+        _notify_hermes_agent(
+            kb_name=kb_name,
+            filename=os.path.basename(file.filename) if file.filename else "unknown",
+            learner_id=learner_id,
+            result=result,
+            trace_id=trace_id,
+            source_url=source_url,
+        )
+    )
     return {
-        "ok": True, "trace_id": trace_id, "status": "completed",
-        "filename": file.filename, "kb_name": kb_name,
-        "intent": result.get("intent"), "route": result.get("route"),
+        "ok": True,
+        "trace_id": trace_id,
+        "status": "completed",
+        "filename": file.filename,
+        "kb_name": kb_name,
+        "intent": result.get("intent"),
+        "route": result.get("route"),
         "content_len": len(result.get("content", "")),
     }
 
@@ -1491,37 +1855,61 @@ async def api_create_kb_and_ingest(
     if learner_id == "default":
         logger.warning("[%s] create_kb_and_ingest called with default learner_id", trace_id)
     from tutor_platform.ingest_status import IngestStatusTracker
-    IngestStatusTracker.mark(trace_id, "processing", {
-        "filename": file.filename or "", "kb_name": kb_name, "source": "web",
-    })
+
+    IngestStatusTracker.mark(
+        trace_id,
+        "processing",
+        {
+            "filename": file.filename or "",
+            "kb_name": kb_name,
+            "source": "web",
+        },
+    )
     provider = await _get_provider()
     result = await _handle_inbound_file(
         file_path=dest,
         metadata={
-            "source": "web", "kb_name": kb_name, "learner_id": learner_id,
-            "trace_id": trace_id, "tool_name": tool_name,
+            "source": "web",
+            "kb_name": kb_name,
+            "learner_id": learner_id,
+            "trace_id": trace_id,
+            "tool_name": tool_name,
         },
     )
-    IngestStatusTracker.mark(trace_id, "completed", {
-        "intent": result.get("intent"), "route": result.get("route"),
-        "storage_ok": result.get("storage", {}).get("ok", False),
-    })
-    asyncio.create_task(_notify_hermes_agent(
-        kb_name=kb_name, filename=os.path.basename(file.filename) if file.filename else "unknown",
-        learner_id=learner_id, result=result,
-        trace_id=trace_id, source_url=source_url,
-    ))
+    IngestStatusTracker.mark(
+        trace_id,
+        "completed",
+        {
+            "intent": result.get("intent"),
+            "route": result.get("route"),
+            "storage_ok": result.get("storage", {}).get("ok", False),
+        },
+    )
+    asyncio.create_task(
+        _notify_hermes_agent(
+            kb_name=kb_name,
+            filename=os.path.basename(file.filename) if file.filename else "unknown",
+            learner_id=learner_id,
+            result=result,
+            trace_id=trace_id,
+            source_url=source_url,
+        )
+    )
     return {
-        "ok": True, "trace_id": trace_id, "status": "completed",
-        "filename": file.filename, "kb_name": kb_name,
-        "intent": result.get("intent"), "route": result.get("route"),
+        "ok": True,
+        "trace_id": trace_id,
+        "status": "completed",
+        "filename": file.filename,
+        "kb_name": kb_name,
+        "intent": result.get("intent"),
+        "route": result.get("route"),
         "content_len": len(result.get("content", "")),
     }
 
 
 @app.post("/api/process/file")
 async def api_process_file(request: Request):
-    trace_id = getattr(request.state, 'trace_id', None) or _generate_trace_id()
+    trace_id = getattr(request.state, "trace_id", None) or _generate_trace_id()
     tool_name = request.headers.get("X-Tool-Name", "")
     content_type = request.headers.get("content-type", "")
 
@@ -1578,27 +1966,48 @@ async def api_process_file(request: Request):
             _save_ocr_warmed()
 
     from tutor_platform.ingest_status import IngestStatusTracker
-    IngestStatusTracker.mark(trace_id, "processing", {
-        "source": "mcp", "kb_name": kb_name, "learner_id": learner_id,
-    })
+
+    IngestStatusTracker.mark(
+        trace_id,
+        "processing",
+        {
+            "source": "mcp",
+            "kb_name": kb_name,
+            "learner_id": learner_id,
+        },
+    )
 
     result = await _handle_inbound_file(
         file_path=file_path_ref,
-        metadata={"source": "mcp", "kb_name": kb_name, "learner_id": learner_id,
-                  "trace_id": trace_id, "tool_name": tool_name},
+        metadata={
+            "source": "mcp",
+            "kb_name": kb_name,
+            "learner_id": learner_id,
+            "trace_id": trace_id,
+            "tool_name": tool_name,
+        },
     )
 
-    IngestStatusTracker.mark(trace_id, "completed", {
-        "intent": result.get("intent"), "route": result.get("route"),
-        "storage_ok": result.get("storage", {}).get("ok", False),
-    })
+    IngestStatusTracker.mark(
+        trace_id,
+        "completed",
+        {
+            "intent": result.get("intent"),
+            "route": result.get("route"),
+            "storage_ok": result.get("storage", {}).get("ok", False),
+        },
+    )
 
-    asyncio.create_task(_notify_hermes_agent(
-        kb_name=kb_name,
-        filename=file.filename if file and file.filename else os.path.basename(file_path_ref),
-        learner_id=learner_id, result=result,
-        trace_id=trace_id, source_url=source_url,
-    ))
+    asyncio.create_task(
+        _notify_hermes_agent(
+            kb_name=kb_name,
+            filename=file.filename if file and file.filename else os.path.basename(file_path_ref),
+            learner_id=learner_id,
+            result=result,
+            trace_id=trace_id,
+            source_url=source_url,
+        )
+    )
 
     # ── Update context cache + persist to disk for ALL files with OCR content ──
     # 后续 auto-trigger 或 tutor_chat 会从缓存取 context 更新 SOUL.md
@@ -1609,18 +2018,24 @@ async def api_process_file(request: Request):
         if len(_last_tutor_context) > _MAX_CACHED_CONTEXTS:
             _last_tutor_context.clear()
         _save_context_to_disk(learner_id)
-        logger.info("[%s] Cached context for %s (%d chars)", trace_id, learner_id, len(_ocr_content))
+        logger.info(
+            "[%s] Cached context for %s (%d chars)", trace_id, learner_id, len(_ocr_content)
+        )
 
         # ── 入库: 异步将提取文本写入知识库 ChromaDB ──
-        asyncio.create_task(_ingest_to_kb(
-            provider=provider,
-            content=_ocr_content,
-            kb_name=kb_name,
-            filename=file.filename if file and file.filename else os.path.basename(file_path_ref),
-            learner_id=learner_id,
-            source="weixin",
-            trace_id=trace_id,
-        ))
+        asyncio.create_task(
+            _ingest_to_kb(
+                provider=provider,
+                content=_ocr_content,
+                kb_name=kb_name,
+                filename=file.filename
+                if file and file.filename
+                else os.path.basename(file_path_ref),
+                learner_id=learner_id,
+                source="weixin",
+                trace_id=trace_id,
+            )
+        )
 
     # 🟢 v7.5: auto_teach 参数或 EDUCATION 意图 → 自动触发引导式教学
     # auto_teach=true 由 weixin.py 自动处理传入, 确保不依赖 LLM 自主调用
@@ -1631,7 +2046,11 @@ async def api_process_file(request: Request):
         and result.get("ok")
         and result.get("route") != "ocr_fallback"
         and _is_educational_content(_ocr_content)
-    ) or (result.get("intent") == "EDUCATION" and result.get("ok") and result.get("route") != "ocr_fallback")
+    ) or (
+        result.get("intent") == "EDUCATION"
+        and result.get("ok")
+        and result.get("route") != "ocr_fallback"
+    )
 
     if _auto_teach_effective:
         content = _ocr_content
@@ -1650,7 +2069,8 @@ async def api_process_file(request: Request):
                 else:
                     logger.warning(
                         "[%s] Auto tutor_chat returned no content: %s",
-                        trace_id, tutor_result.get("error", "empty response"),
+                        trace_id,
+                        tutor_result.get("error", "empty response"),
                     )
             except Exception as e:
                 logger.warning("[%s] Auto tutor_chat failed: %s", trace_id, e)
@@ -1682,27 +2102,49 @@ async def api_ingest_file(
         f.write(content)
 
     from tutor_platform.ingest_status import IngestStatusTracker
-    IngestStatusTracker.mark(trace_id, "processing", {
-        "source": "mcp", "kb_name": kb_name, "learner_id": learner_id,
-    })
+
+    IngestStatusTracker.mark(
+        trace_id,
+        "processing",
+        {
+            "source": "mcp",
+            "kb_name": kb_name,
+            "learner_id": learner_id,
+        },
+    )
 
     provider = await _get_provider()
     result = await _handle_inbound_file(
         file_path=dest,
-        metadata={"source": "mcp", "kb_name": kb_name, "learner_id": learner_id,
-                  "trace_id": trace_id, "tool_name": tool_name},
+        metadata={
+            "source": "mcp",
+            "kb_name": kb_name,
+            "learner_id": learner_id,
+            "trace_id": trace_id,
+            "tool_name": tool_name,
+        },
     )
 
-    IngestStatusTracker.mark(trace_id, "completed", {
-        "intent": result.get("intent"), "route": result.get("route"),
-        "storage_ok": result.get("storage", {}).get("ok", False),
-    })
+    IngestStatusTracker.mark(
+        trace_id,
+        "completed",
+        {
+            "intent": result.get("intent"),
+            "route": result.get("route"),
+            "storage_ok": result.get("storage", {}).get("ok", False),
+        },
+    )
 
-    asyncio.create_task(_notify_hermes_agent(
-        kb_name=kb_name, filename=filename,
-        learner_id=learner_id, result=result,
-        trace_id=trace_id, source_url=f"/sources/{archive_name}",
-    ))
+    asyncio.create_task(
+        _notify_hermes_agent(
+            kb_name=kb_name,
+            filename=filename,
+            learner_id=learner_id,
+            result=result,
+            trace_id=trace_id,
+            source_url=f"/sources/{archive_name}",
+        )
+    )
     return result
 
 
@@ -2031,7 +2473,9 @@ async def _update_soul_with_context(
                 if len(_kb_found) >= 3:
                     break
         if _kb_found:
-            _persona += "\n### 相关知识库参考\n以下是与当前教学内容相关的背景知识点，可用于辅助讲解：\n"
+            _persona += (
+                "\n### 相关知识库参考\n以下是与当前教学内容相关的背景知识点，可用于辅助讲解：\n"
+            )
             for _dc in _kb_found:
                 _persona += f"- {_dc}\n"
     except Exception:
@@ -2041,7 +2485,9 @@ async def _update_soul_with_context(
     try:
         _due = await asyncio.to_thread(get_due_reviews, learner_id)
         if _due:
-            _lines = ["\n### 到期复习知识点（优先复习）\n以下知识点今天到期需要复习，请优先安排复习："]
+            _lines = [
+                "\n### 到期复习知识点（优先复习）\n以下知识点今天到期需要复习，请优先安排复习："
+            ]
             for r in _due[:5]:
                 _name = r["kp_id"].split("/")[-1]
                 _pct = int(r["level"] * 100)
@@ -2055,7 +2501,9 @@ async def _update_soul_with_context(
     try:
         _weak = await asyncio.to_thread(weak_points, learner_id)
         if _weak:
-            _lines = ["\n### 该学生薄弱知识点（教学重点）\n以下知识点该学生掌握不足，请重点加强引导："]
+            _lines = [
+                "\n### 该学生薄弱知识点（教学重点）\n以下知识点该学生掌握不足，请重点加强引导："
+            ]
             for w in _weak[:5]:
                 _name = w["kp_id"].split("/")[-1]
                 _pct = int(w["level"] * 100)
@@ -2083,21 +2531,32 @@ async def _update_soul_with_context(
             async with httpx.AsyncClient(timeout=10) as _c:
                 _r = await _c.get(f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher")
                 if _r.status_code == 404:
-                    await _c.post(f"{DEEPTUTOR_URL}/api/v1/tutorbot", json={
-                        "bot_id": "teacher", "name": "AI 家庭教师", "persona": _persona,
-                    })
+                    await _c.post(
+                        f"{DEEPTUTOR_URL}/api/v1/tutorbot",
+                        json={
+                            "bot_id": "teacher",
+                            "name": "AI 家庭教师",
+                            "persona": _persona,
+                        },
+                    )
                 elif _r.status_code == 200:
-                    await _c.patch(f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher", json={"persona": _persona})
+                    await _c.patch(
+                        f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher", json={"persona": _persona}
+                    )
                     _soul_version += 1
                     _ver = _soul_version
-                    await _c.put(f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher/files/SOUL.md",
-                                 json={"content": f"<!-- SOUL.md v{_ver} for learner:{learner_id} -->\n{_persona}"})
+                    await _c.put(
+                        f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher/files/SOUL.md",
+                        json={
+                            "content": f"<!-- SOUL.md v{_ver} for learner:{learner_id} -->\n{_persona}"
+                        },
+                    )
         except Exception:
             logger.warning("SOUL.md update failed for %s, continuing", learner_id)
 
 
 # Answer evaluation marker pattern: [ANSWER:correct|wrong:kp_id]
-_ANSWER_RE = re.compile(r'\n?\[ANSWER:(correct|wrong):([^\]]+)\]')
+_ANSWER_RE = re.compile(r"\n?\[ANSWER:(correct|wrong):([^\]]+)\]")
 
 
 def _parse_answer_evaluation(content: str) -> tuple[str, str, str]:
@@ -2160,8 +2619,8 @@ async def _trigger_practice_if_needed(learner_id: str, kp_id: str, trace_id: str
 
     user_prompt = (
         f"## 学生错题记录\n{wrong_context}\n\n"
-        f"## 要求\n请生成3道针对\"{topic}\"({domain})的练习题。\n\n"
-        "只返回JSON，格式：{\"questions\":[{\"question\":\"...\",\"options\":{\"A\":\"...\",\"B\":\"...\",\"C\":\"...\",\"D\":\"...\"},\"correct_answer\":\"...\",\"explanation\":\"...\"}]}"
+        f'## 要求\n请生成3道针对"{topic}"({domain})的练习题。\n\n'
+        '只返回JSON，格式：{"questions":[{"question":"...","options":{"A":"...","B":"...","C":"...","D":"..."},"correct_answer":"...","explanation":"..."}]}'
     )
 
     try:
@@ -2190,18 +2649,24 @@ async def _trigger_practice_if_needed(learner_id: str, kp_id: str, trace_id: str
 
             import json as json_lib
             import re
+
             try:
                 questions = json_lib.loads(content)
             except json_lib.JSONDecodeError:
-                m = re.search(r'```(?:json)?\s*([\s\S]*?)```', content)
+                m = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
                 if m:
                     questions = json_lib.loads(m.group(1))
                 else:
                     return []
 
             qs = questions.get("questions", [])
-            logger.info("[%s] auto-practice: %d questions generated for %s/%s",
-                        trace_id, len(qs), learner_id, kp_id)
+            logger.info(
+                "[%s] auto-practice: %d questions generated for %s/%s",
+                trace_id,
+                len(qs),
+                learner_id,
+                kp_id,
+            )
             return qs
     except Exception as e:
         logger.warning("[%s] auto-practice failed: %s", trace_id, e)
@@ -2234,8 +2699,13 @@ async def _auto_generate_exam(learner_id: str, trace_id: str):
     exam_text = result["exam_text"]
     # Save as pending exam context — next teaching interaction will pick it up
     _pending_exam_context[learner_id] = exam_text
-    logger.info("[%s] Auto-exam generated for %s: %d questions, %d KPIs",
-                trace_id, learner_id, result["total"], len(result.get("kp_covered", [])))
+    logger.info(
+        "[%s] Auto-exam generated for %s: %d questions, %d KPIs",
+        trace_id,
+        learner_id,
+        result["total"],
+        len(result.get("kp_covered", [])),
+    )
 
 
 _pending_exam_context: dict[str, str] = {}
@@ -2246,7 +2716,7 @@ def _polish_guide_response(content: str) -> str:
     ensure ends with a guiding question."""
     # Strip ✅/❌ (explicitly forbidden by SOUL.md)
     content = content.replace("✅", "").replace("❌", "")
-    content = re.sub(r'\n{3,}', '\n\n', content).strip()
+    content = re.sub(r"\n{3,}", "\n\n", content).strip()
     # If DT Bot forgot the guiding question, append one
     if "？" not in content and "?" not in content:
         content += "\n\n你知道这道题的答案吗？"
@@ -2394,11 +2864,13 @@ async def _tutor_chat_core(
         _should_retry = False
 
         # --- Local LLM weak → fallback to DeepSeek ---
-        if (_llm_local and (not result.get("ok")
-                or len(result.get("content", "").strip()) < _MIN_CHARS)):
+        if _llm_local and (
+            not result.get("ok") or len(result.get("content", "").strip()) < _MIN_CHARS
+        ):
             logger.warning(
                 "[%s] Local model weak (len=%d), falling back to DeepSeek",
-                trace_id, len(result.get("content", "")),
+                trace_id,
+                len(result.get("content", "")),
             )
             _llm_lock.release()
             _llm_local = False
@@ -2411,14 +2883,17 @@ async def _tutor_chat_core(
         elif not _llm_local and not result.get("ok"):
             logger.warning(
                 "[%s] Cloud returned empty (ok=%s), retrying once",
-                trace_id, result.get("ok"),
+                trace_id,
+                result.get("ok"),
             )
             _should_retry = True
 
         if _should_retry:
             # Ensure DT profile is on DeepSeek before retry
             if _last_llm_profile != ("deepseek", "deepseek-v4-flash"):
-                _profile_switched = await _switch_dt_profile("deepseek", "deepseek-v4-flash", trace_id)
+                _profile_switched = await _switch_dt_profile(
+                    "deepseek", "deepseek-v4-flash", trace_id
+                )
                 if _profile_switched:
                     _last_llm_profile = ("deepseek", "deepseek-v4-flash")
             # Close WS so the next get() triggers a fresh bot start
@@ -2445,14 +2920,26 @@ async def _tutor_chat_core(
                 content = cleaned
                 is_correct = eval_result == "correct"
                 await asyncio.to_thread(
-                    update_mastery, learner_id, eval_kp, is_correct,
-                    question="", user_answer="", correct_answer=""
+                    update_mastery,
+                    learner_id,
+                    eval_kp,
+                    is_correct,
+                    question="",
+                    user_answer="",
+                    correct_answer="",
                 )
                 # Schedule Ebbinghaus review based on updated level
                 kp_data = await asyncio.to_thread(get_mastery, learner_id, eval_kp)
-                await asyncio.to_thread(schedule_review, learner_id, eval_kp, kp_data.get("level", 0))
-                logger.info("[%s] mastery update: %s %s=%s, review scheduled",
-                            trace_id, learner_id, eval_kp, eval_result)
+                await asyncio.to_thread(
+                    schedule_review, learner_id, eval_kp, kp_data.get("level", 0)
+                )
+                logger.info(
+                    "[%s] mastery update: %s %s=%s, review scheduled",
+                    trace_id,
+                    learner_id,
+                    eval_kp,
+                    eval_result,
+                )
 
                 # Trigger practice if wrong answers exceed threshold
                 if not is_correct:
@@ -2465,9 +2952,7 @@ async def _tutor_chat_core(
                     weaks = await asyncio.to_thread(weak_points, learner_id)
                     if len(weaks) >= 3:
                         # Fire-and-forget: generate exam in background
-                        asyncio.create_task(
-                            _auto_generate_exam(learner_id, trace_id)
-                        )
+                        asyncio.create_task(_auto_generate_exam(learner_id, trace_id))
                 except Exception:
                     pass
 
@@ -2562,7 +3047,8 @@ async def api_solve(request: Request):
         return {"ok": False, "error": "question is required"}
 
     import websockets
-    ws_url = f"ws://deeptutor:8001/api/v1/solve"
+
+    ws_url = "ws://deeptutor:8001/api/v1/solve"
     try:
         ws = await asyncio.wait_for(
             websockets.connect(ws_url, close_timeout=10),
@@ -2573,10 +3059,14 @@ async def api_solve(request: Request):
         async with ws:
             # Send question
             await asyncio.wait_for(
-                ws.send(json.dumps({
-                    "question": question,
-                    "detailed_answer": detailed,
-                })),
+                ws.send(
+                    json.dumps(
+                        {
+                            "question": question,
+                            "detailed_answer": detailed,
+                        }
+                    )
+                ),
                 timeout=30,
             )
             # Collect all events until result or error
@@ -2634,7 +3124,7 @@ async def api_vision_solve(request: Request):
             ("/root/.hermes", "/data/hermes"),
         ):
             if image_data.startswith(prefix + "/") or image_data == prefix:
-                actual_path = replacement + image_data[len(prefix):]
+                actual_path = replacement + image_data[len(prefix) :]
                 break
         alt = os.path.join("/data/uploads", os.path.basename(image_data))
         if not os.path.exists(actual_path) and os.path.exists(alt):
@@ -2644,12 +3134,14 @@ async def api_vision_solve(request: Request):
             return {"ok": False, "error": f"图片文件不存在: {image_data}"}
 
         import base64 as b64
+
         with open(actual_path, "rb") as f:
             raw = f.read()
         image_data = b64.b64encode(raw).decode()
 
     import websockets
-    ws_url = f"ws://deeptutor:8001/api/v1/vision/solve"
+
+    ws_url = "ws://deeptutor:8001/api/v1/vision/solve"
     try:
         ws = await asyncio.wait_for(
             websockets.connect(ws_url, close_timeout=10),
@@ -2660,10 +3152,14 @@ async def api_vision_solve(request: Request):
         async with ws:
             # Send image + question
             await asyncio.wait_for(
-                ws.send(json.dumps({
-                    "question": question,
-                    "image_base64": image_data,
-                })),
+                ws.send(
+                    json.dumps(
+                        {
+                            "question": question,
+                            "image_base64": image_data,
+                        }
+                    )
+                ),
                 timeout=30,
             )
             # Collect stream events
@@ -2710,7 +3206,9 @@ class IngestTextRequest(BaseModel):
 async def api_ingest_text(req: IngestTextRequest, request: Request = None):
     trace_id = _extract_trace_id(request) if request else _generate_trace_id()
     provider = await _get_provider()
-    result = await provider.ingest_text(req.content, req.kb_name, req.filename, req.source, trace_id=trace_id)
+    result = await provider.ingest_text(  # type: ignore[attr-defined]
+        req.content, req.kb_name, req.filename, req.source, trace_id=trace_id
+    )
     return result
 
 
@@ -2729,6 +3227,7 @@ class VisionRequest(BaseModel):
 @app.post("/api/ocr")
 async def api_ocr(req: OCRRequest, request: Request = None):
     import base64 as b64
+
     tool_name = request.headers.get("X-Tool-Name", "") if request else ""
     image_data = req.image_data
     if "," in image_data and image_data.startswith("data:"):
@@ -2736,6 +3235,7 @@ async def api_ocr(req: OCRRequest, request: Request = None):
     if req.preprocess:
         try:
             from tutor_platform.tools.preprocess import preprocess_image_bytes
+
             raw = b64.b64decode(image_data)
             image_data = b64.b64encode(preprocess_image_bytes(raw)).decode()
         except ImportError:
@@ -2743,18 +3243,19 @@ async def api_ocr(req: OCRRequest, request: Request = None):
         except Exception:
             pass
     provider = await _get_provider()
-    return await provider.ocr(image_data, req.language, req.return_formulas, return_layout=True, tool_name=tool_name)
+    return await provider.ocr(  # type: ignore[attr-defined]
+        image_data, req.language, req.return_formulas, return_layout=True, tool_name=tool_name
+    )
 
 
 @app.post("/api/vision")
 async def api_vision(req: VisionRequest, request: Request = None):
-    import base64 as b64
     tool_name = request.headers.get("X-Tool-Name", "") if request else ""
     image_data = req.image_data
     if not image_data.startswith("data:"):
         image_data = f"data:image/png;base64,{image_data}"
     provider = await _get_provider()
-    return await provider.vision(image_data, req.question, tool_name=tool_name)
+    return await provider.vision(image_data, req.question, tool_name=tool_name)  # type: ignore[attr-defined]
 
 
 @app.get("/api/mastery/")
@@ -2765,7 +3266,8 @@ def api_list_learners():
         return []
     try:
         learners = sorted(
-            f.name.removesuffix(".json") for f in os.scandir(mastery_root)
+            f.name.removesuffix(".json")
+            for f in os.scandir(mastery_root)
             if f.is_file() and f.name.endswith(".json")
         )
         return learners
@@ -2779,6 +3281,7 @@ def api_get_mastery(learner_id: str, kp_id: str = ""):
     if kp_id:
         return get_mastery(learner_id, kp_id)
     from domains.tutoring.mastery import get_mastery_summary
+
     return get_mastery_summary(learner_id)
 
 
@@ -2834,8 +3337,8 @@ async def api_generate_report(request: Request):
     """
     from tutor_platform.report_push import (
         format_daily_report,
-        format_parent_report_for_wechat,
         format_monthly_report_text,
+        format_parent_report_for_wechat,
     )
 
     body = await request.json()
@@ -2869,8 +3372,8 @@ async def api_report_push(request: Request):
     """
     from tutor_platform.report_scheduler import (
         push_daily_reports,
-        push_weekly_reports,
         push_monthly_reports,
+        push_weekly_reports,
     )
 
     body = await request.json()
@@ -2944,7 +3447,7 @@ async def api_generate_practice(request: Request):
 
     user_prompt = (
         f"## 学生错题记录\n{wrong_context}\n\n"
-        f"## 要求\n请生成{count}道针对\"{topic}\"({domain})的练习题。\n\n"
+        f'## 要求\n请生成{count}道针对"{topic}"({domain})的练习题。\n\n'
         "请以JSON格式返回，格式如下：\n"
         "{\n"
         '  "questions": [\n'
@@ -2981,7 +3484,9 @@ async def api_generate_practice(request: Request):
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             if resp.status_code != 200:
-                logger.error("[%s] generate_practice LLM error: HTTP %s", trace_id, resp.status_code)
+                logger.error(
+                    "[%s] generate_practice LLM error: HTTP %s", trace_id, resp.status_code
+                )
                 return {"ok": False, "error": f"LLM API error: HTTP {resp.status_code}"}
 
             result = resp.json()
@@ -2990,11 +3495,13 @@ async def api_generate_practice(request: Request):
                 return {"ok": False, "error": "LLM returned empty response"}
 
             import json as json_lib
+
             try:
                 questions = json_lib.loads(content)
             except json_lib.JSONDecodeError:
                 import re
-                m = re.search(r'```(?:json)?\s*([\s\S]*?)```', content)
+
+                m = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
                 if m:
                     questions = json_lib.loads(m.group(1))
                 else:
@@ -3002,8 +3509,13 @@ async def api_generate_practice(request: Request):
                     return {"ok": False, "error": "无法解析生成的题目"}
 
             qs = questions.get("questions", [])
-            logger.info("[%s] generate_practice: %d questions for %s/%s",
-                        trace_id, len(qs), learner_id, kp_id)
+            logger.info(
+                "[%s] generate_practice: %d questions for %s/%s",
+                trace_id,
+                len(qs),
+                learner_id,
+                kp_id,
+            )
             return {
                 "ok": True,
                 "kp_id": kp_id,
@@ -3056,7 +3568,9 @@ async def _generate_exam_paper(
     weak_context_lines = ["## 学生薄弱知识点"]
     for w in weaks[:8]:
         kp_name = w["kp_id"].split("/")[-1]
-        weak_context_lines.append(f"- {kp_name}（正确率 {int(w['level']*100)}%，已答 {w['total']} 题）")
+        weak_context_lines.append(
+            f"- {kp_name}（正确率 {int(w['level'] * 100)}%，已答 {w['total']} 题）"
+        )
 
     wrong_context_lines = ["## 近期错题记录"]
     for w in wrongs[:10]:
@@ -3151,10 +3665,11 @@ async def _generate_exam_paper(
 
             import json as json_lib
             import re
+
             try:
                 paper = json_lib.loads(content)
             except json_lib.JSONDecodeError:
-                m = re.search(r'```(?:json)?\s*([\s\S]*?)```', content)
+                m = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
                 if m:
                     paper = json_lib.loads(m.group(1))
                 else:
@@ -3165,7 +3680,7 @@ async def _generate_exam_paper(
             title = paper.get("title", "强化训练")
             sections = paper.get("sections", [])
             exam_lines = [title, "=" * len(title), ""]
-            all_questions = []
+            all_questions: list[dict] = []
             kp_covered = set()
 
             for sec in sections:
@@ -3195,7 +3710,10 @@ async def _generate_exam_paper(
             total = len(all_questions)
             logger.info(
                 "[%s] exam_paper: %d questions covering %d KPIs for %s",
-                trace_id, total, len(kp_covered), learner_id,
+                trace_id,
+                total,
+                len(kp_covered),
+                learner_id,
             )
 
             return {
@@ -3206,7 +3724,8 @@ async def _generate_exam_paper(
                 "total": total,
                 "sections": [
                     {"type": s["type"], "count": len(s.get("questions", []))}
-                    for s in sections if s.get("questions")
+                    for s in sections
+                    if s.get("questions")
                 ],
             }
     except httpx.TimeoutException:
@@ -3277,7 +3796,9 @@ async def api_sync_quiz(req: QuizSyncRequest, request: Request = None):
     learner_id = req.learner_id or "default"
     results = req.results or []
     if not results and req.session_id:
-        logger.warning("[sync_quiz] trace=%s empty results for session=%s", trace_id, req.session_id)
+        logger.warning(
+            "[sync_quiz] trace=%s empty results for session=%s", trace_id, req.session_id
+        )
         return {"ok": True, "synced": 0, "note": "no quiz results to sync"}
     return await _sync_quiz_with_retry(learner_id, results, trace_id)
 
@@ -3285,32 +3806,58 @@ async def api_sync_quiz(req: QuizSyncRequest, request: Request = None):
 @app.get("/admin/gc")
 async def admin_gc():
     import gc
+
     before = {"collections": [gc.get_count()[i] for i in range(3)]}
     gc.collect()
     after = {"collections": [gc.get_count()[i] for i in range(3)]}
     mem_info = {"gc_triggered": True}
     try:
         import psutil
+
         proc = psutil.Process()
         mem = proc.memory_info()
-        mem_info.update({
-            "rss_mb": round(mem.rss / 1024 / 1024, 1),
-            "vms_mb": round(mem.vms / 1024 / 1024, 1),
-            "percent": round(proc.memory_percent(), 1),
-        })
+        mem_info.update(
+            {
+                "rss_mb": round(mem.rss / 1024 / 1024, 1),
+                "vms_mb": round(mem.vms / 1024 / 1024, 1),
+                "percent": round(proc.memory_percent(), 1),
+            }
+        )
     except ImportError:
         mem_info["note"] = "psutil not installed"
     return {"ok": True, "gc_before": before, "gc_after": after, "memory": mem_info}
 
 
 # iLink Bot 二维码缓存
+# ── QR cache & bootstrap state ──
 _qr_code_cache: dict = {}
 
+# Parent bootstrap state: in-memory tracker for first-time setup flow.
+# All QR codes here are freshly generated — never returned from _qr_code_cache.
+# Access must hold _bootstrap_lock.
+_bootstrap_state: dict = {
+    "status": "idle",  # idle | generating | qr_ready | restarting | bound | error
+    "qr_url": "",
+    "qr_created_at": 0.0,  # time.monotonic() when QR was generated
+    "error": "",
+}
+_bootstrap_lock = asyncio.Lock()
+_BOOTSTRAP_QR_TTL = 60  # seconds before QR is considered expired (iLink server TTL is ~60-120s)
+
+# Child bootstrap state: in-memory tracker for child gateway binding.
+# Prevents duplicate restarts when multiple bind_child requests arrive.
+# Access must hold _child_bootstrap_lock.
+_child_bootstrap_state: dict = {
+    "status": "idle",  # idle | restarting | bound | error
+    "error": "",
+}
+_child_bootstrap_lock = asyncio.Lock()
+
 # iLink API 错误分类, 用于 /bind-qr 页面展示友好提示
-QR_ERR_NOT_FOUND = "BOT_NOT_FOUND"   # Bot 未注册 / token 无效 (页面端判断用)
-QR_ERR_NETWORK  = "NETWORK_ERROR"    # 网络不通或 iLink 服务端异常
-QR_ERR_EMPTY    = "EMPTY_RESPONSE"   # 返回了空数据
-QR_ERR_AUTH     = "BOT_NOT_FOUND"    # 页面端统一用 BOT_NOT_FOUND 判断未配置状态
+QR_ERR_NOT_FOUND = "BOT_NOT_FOUND"  # Bot 未注册 / token 无效 (页面端判断用)
+QR_ERR_NETWORK = "NETWORK_ERROR"  # 网络不通或 iLink 服务端异常
+QR_ERR_EMPTY = "EMPTY_RESPONSE"  # 返回了空数据
+QR_ERR_AUTH = "BOT_NOT_FOUND"  # 页面端统一用 BOT_NOT_FOUND 判断未配置状态
 
 
 def _categorize_ilink_error(exc: Exception) -> str:
@@ -3330,8 +3877,7 @@ def _categorize_ilink_error(exc: Exception) -> str:
 
 
 @app.get("/api/bot/qrcode")
-async def get_bot_qrcode(refresh: bool = False, text_only: bool = False,
-                          bot_type: str = "parent"):
+async def get_bot_qrcode(refresh: bool = False, text_only: bool = False, bot_type: str = "parent"):
     """获取 iLink Bot 添加好友二维码。
 
     家长在微信中发送"加孩子学习"时, HA agent 通过 MCP tool 调用此接口,
@@ -3368,7 +3914,8 @@ async def get_bot_qrcode(refresh: bool = False, text_only: bool = False,
     if not weixin_token:
         if bot_type == "child":
             return {
-                "ok": False, "error": (
+                "ok": False,
+                "error": (
                     "孩子机器人尚未绑定，请先在设备终端运行: "
                     "bash scripts/setup_wechat_child.sh 完成绑定后再生成二维码。"
                 ),
@@ -3377,10 +3924,11 @@ async def get_bot_qrcode(refresh: bool = False, text_only: bool = False,
         # Parent token empty — device not yet bound.
         # 当 refresh=True 时禁止返回过期缓存（可能来自之前的子网关二维码或已过期的父网关二维码）
         cache = _qr_code_cache
-        if cache.get("png_b64") and not refresh:
+        if cache.get(f"{bot_type}_png_b64") and not refresh:
             import base64
+
             return Response(
-                content=base64.b64decode(cache["png_b64"]),
+                content=base64.b64decode(cache[f"{bot_type}_png_b64"]),
                 media_type="image/png",
                 headers={"X-QR-Cached": "true", "X-QR-Error-Type": QR_ERR_AUTH},
             )
@@ -3411,19 +3959,23 @@ async def get_bot_qrcode(refresh: bool = False, text_only: bool = False,
         # 无 token / token 无效时返回清晰提示
         if err_type == QR_ERR_AUTH:
             if bot_type == "child":
-                err_msg = ("孩子机器人尚未绑定，无法生成子网关二维码。"
-                           "请先让管理员在设备终端运行: bash scripts/setup_wechat_child.sh 完成绑定。")
+                err_msg = (
+                    "孩子机器人尚未绑定，无法生成子网关二维码。"
+                    "请先让管理员在设备终端运行: bash scripts/setup_wechat_child.sh 完成绑定。"
+                )
             else:
-                err_msg = ("家长您好，设备尚未绑定微信机器人，无法生成子网关二维码。"
-                           "请先让管理员在设备终端运行: bash scripts/setup_wechat.sh 完成绑定。")
+                err_msg = (
+                    "家长您好，设备尚未绑定微信机器人，无法生成子网关二维码。"
+                    "请先让管理员在设备终端运行: bash scripts/setup_wechat.sh 完成绑定。"
+                )
         elif err_type == QR_ERR_NETWORK:
             err_msg = "获取二维码失败: 网络连接异常，请检查设备网络后重试。"
         else:
             err_msg = f"获取二维码失败: {e}"
         cache = _qr_code_cache
-        if cache.get("png_b64") and not refresh and not text_only:
+        if cache.get(f"{bot_type}_png_b64") and not refresh and not text_only:
             return Response(
-                content=base64.b64decode(cache["png_b64"]),
+                content=base64.b64decode(cache[f"{bot_type}_png_b64"]),
                 media_type="image/png",
                 headers={
                     "X-QR-Cached": "true",
@@ -3436,8 +3988,12 @@ async def get_bot_qrcode(refresh: bool = False, text_only: bool = False,
     qrcode_url = str(data.get("qrcode_img_content") or "")
     qrcode_value = str(data.get("qrcode") or "")
     qr_scan_data = qrcode_url if qrcode_url else qrcode_value
-    logger.info("iLink QR response: url_len=%s qr_len=%s ret=%s",
-                len(qrcode_url), len(qrcode_value), data.get("ret"))
+    logger.info(
+        "iLink QR response: url_len=%s qr_len=%s ret=%s",
+        len(qrcode_url),
+        len(qrcode_value),
+        data.get("ret"),
+    )
     if not qr_scan_data:
         logger.warning("iLink returned empty QR data: %s", data)
         return {"ok": False, "error": "iLink 未返回二维码数据", "error_type": QR_ERR_EMPTY}
@@ -3448,6 +4004,7 @@ async def get_bot_qrcode(refresh: bool = False, text_only: bool = False,
 
     try:
         import qrcode as _qrlib
+
         _qr = _qrlib.QRCode(box_size=8, border=2)
         _qr.add_data(qr_scan_data)
         _qr.make(fit=True)
@@ -3457,14 +4014,34 @@ async def get_bot_qrcode(refresh: bool = False, text_only: bool = False,
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
         cache = _qr_code_cache
-        cache["png_b64"] = base64.b64encode(png_bytes).decode()
-        cache["qr_url"] = qrcode_url
+        cache[f"{bot_type}_png_b64"] = base64.b64encode(png_bytes).decode()
+        cache[f"{bot_type}_qr_url"] = qrcode_url
 
         return Response(content=png_bytes, media_type="image/png")
     except ImportError:
         return {"ok": False, "error": "服务端缺少 qrcode 库 (qrcode[pil])"}
     except Exception as e:
         return {"ok": False, "error": f"生成二维码图片失败: {e}"}
+
+
+@app.get("/api/bot/bind_child/status")
+async def bind_child_status():
+    """查询孩子网关绑定状态。
+
+    检测层次:
+    1. CHILD_WEIXIN_TOKEN 环境变量 → bound
+    2. 持久身份文件存在 → bound
+    3. _child_bootstrap_state 中的进度信息
+
+    用于 MCP 工具和调试界面判断孩子绑定状态。
+    """
+    if os.getenv("CHILD_WEIXIN_TOKEN", "").strip():
+        return {"ok": True, "bound": True, "source": "env"}
+    if os.path.exists("/data/hermes_child/.child_identity.json"):
+        return {"ok": True, "bound": True, "source": "identity_file"}
+    async with _child_bootstrap_lock:
+        bs = dict(_child_bootstrap_state)
+    return {"ok": True, "bound": False, "bootstrap": bs}
 
 
 # ── Docker exec helpers (for child bot binding) ──
@@ -3479,6 +4056,7 @@ class _DockerStreamBuf:
     Docker raw-stream format (Tty=false):
       [1 byte stream_type] [3 bytes padding] [4 bytes big-endian length] [data]
     """
+
     def __init__(self):
         self._buf = bytearray()
         self._frames: list[tuple[int, bytes]] = []
@@ -3502,26 +4080,46 @@ class _DockerStreamBuf:
         return self._frames
 
 
-_QR_LOGIN_SCRIPT = """
-import asyncio, json, os, sys
+# Generic QR login stub — used for both parent and child bootstrap.
+# %(hermes_home)s  → parent: /opt/data ,  child: /opt/data/child
+# %(identity_name)s → parent: .parent_identity.json ,  child: .child_identity.json
+# WARNING: stdout is redirected to stderr during qr_login() so QR URLs land on
+#          stderr (channel 2) where the Docker stream parser reads them. After
+#          qr_login() completes stdout is restored for credential JSON output.
+_QR_LOGIN_STUB = """
+import asyncio, json, os, sys, traceback
 from gateway.platforms.weixin import qr_login
 
 old_out = sys.stdout
-sys.stdout = sys.stderr  # QR text -> stderr (captured by API)
+sys.stdout = sys.stderr
 try:
-    creds = asyncio.run(qr_login('/opt/data/child'))
+    creds = asyncio.run(qr_login('%(hermes_home)s'))
+except Exception:
+    traceback.print_exc()
+    creds = None
 finally:
     sys.stdout = old_out
 
 if creds:
-    # Atomic write for gateway_start.sh to read on restart
-    tmp = '/opt/data/child/.child_identity.json.tmp'
+    identity_path = '%(hermes_home)s/%(identity_name)s'
+    tmp = identity_path + '.tmp'
     with open(tmp, 'w') as f:
         json.dump(creds, f, ensure_ascii=False)
-    os.replace(tmp, '/opt/data/child/.child_identity.json')
+    os.replace(tmp, identity_path)
     print(json.dumps(creds, ensure_ascii=False))
     sys.stdout.flush()
+else:
+    msg = "qr_login() returned None or raised an exception — binding failed"
+    print(msg, file=sys.stderr)
 """
+
+
+def _make_qr_login_script(hermes_home: str, identity_name: str = ".parent_identity.json") -> str:
+    """Build the QR login Python snippet for a given hermes_home path."""
+    return _QR_LOGIN_STUB % {
+        "hermes_home": hermes_home,
+        "identity_name": identity_name,
+    }
 
 
 async def _docker_exec_bind_child() -> dict:
@@ -3534,13 +4132,20 @@ async def _docker_exec_bind_child() -> dict:
         create_resp = await client.post(
             f"http://localhost/containers/{_HERMES_CONTAINER}/exec",
             json={
-                "Cmd": ["python3", "-c", _QR_LOGIN_SCRIPT],
+                "Cmd": [
+                    "python3",
+                    "-c",
+                    _make_qr_login_script("/opt/data/child", ".child_identity.json"),
+                ],
                 "AttachStdout": True,
                 "AttachStderr": True,
             },
         )
         if create_resp.status_code == 404:
-            return {"ok": False, "error": f"容器 {_HERMES_CONTAINER} 未找到，请确认 hermes_agent 正在运行"}
+            return {
+                "ok": False,
+                "error": f"容器 {_HERMES_CONTAINER} 未找到，请确认 hermes_agent 正在运行",
+            }
         create_resp.raise_for_status()
         exec_id = create_resp.json()["Id"]
 
@@ -3564,7 +4169,11 @@ async def _docker_exec_bind_child() -> dict:
                                 stderr_text += sdata.decode("utf-8", errors="replace")
                                 for line in stderr_text.split("\n"):
                                     line_s = line.strip()
-                                    if line_s.startswith("https://") and "://" in line_s and len(line_s) > 10:
+                                    if (
+                                        line_s.startswith("https://")
+                                        and "://" in line_s
+                                        and len(line_s) > 10
+                                    ):
                                         qr_text = line_s
                                         break
                         if qr_text:
@@ -3572,11 +4181,9 @@ async def _docker_exec_bind_child() -> dict:
         except asyncio.TimeoutError:
             pass  # 25s timeout — enough for QR, exec continues waiting for scan
 
-        if not qr_text and stderr_text:
-            qr_text = stderr_text[:500]
-
         if not qr_text:
-            return {"ok": False, "error": "无法从孩子机器人获取二维码，请检查 hermes_agent 日志"}
+            detail = (stderr_text or "无输出")[:300]
+            return {"ok": False, "error": f"qr_login 未输出有效二维码: {detail}"}
 
         return {"ok": True, "qr_text": qr_text}
 
@@ -3633,8 +4240,9 @@ async def bind_child(force: bool = False):
     通过 Docker socket 在 hermes_agent 容器中执行 qr_login() 创建新的孩子机器人身份,
     返回二维码图片供家长转发给孩子扫码绑定。
 
-    绑定完成后, 凭据保存到共享卷 /data/hermes_child/.child_identity.json,
-    由 cron 检测后持久化到 .env 并重启 hermes_agent 使子网关生效。
+    绑定完成后, 凭据保存到共享卷 /data/hermes_child/.child_identity.json。
+    _wait_child_bootstrap() 后台任务检测到文件后自动重启 hermes_agent,
+    gateway_start.sh 降级加载 identity 使子网关生效。
 
     force=true 时忽略已有绑定状态, 强制创建新身份 (用于重新绑定 / 换绑场景).
     """
@@ -3643,7 +4251,11 @@ async def bind_child(force: bool = False):
     already_bound = bool(child_token or os.path.exists(identity_file))
 
     if already_bound and not force:
-        return {"ok": False, "error": "孩子机器人已绑定", "hint": "请使用 get_bot_qrcode(bot_type='child') 获取子网关二维码; 如需重新绑定请设置 force=true"}
+        return {
+            "ok": False,
+            "error": "孩子机器人已绑定",
+            "hint": "请使用 get_bot_qrcode(bot_type='child') 获取子网关二维码; 如需重新绑定请设置 force=true",
+        }
 
     if already_bound and force:
         logger.info("Force re-binding child bot — cleaning old identity...")
@@ -3666,7 +4278,6 @@ async def bind_child(force: bool = False):
         except OSError:
             pass
 
-    import base64
     from io import BytesIO
 
     # 清理过期缓存，确保返回的是新生成的子网关二维码
@@ -3677,6 +4288,12 @@ async def bind_child(force: bool = False):
         return result
 
     qr_scan_data = result["qr_text"]
+
+    # Start background watcher (child identity file → restart hermes_agent)
+    async with _child_bootstrap_lock:
+        _child_bootstrap_state["status"] = "idle"
+        _child_bootstrap_state["error"] = ""
+    asyncio.create_task(_wait_child_bootstrap())
     try:
         import qrcode as _qrlib
 
@@ -3691,9 +4308,6 @@ async def bind_child(force: bool = False):
         return {"ok": True, "url": qr_scan_data, "text_only": True}
     except Exception as e:
         return {"ok": False, "error": f"生成二维码图片失败: {e}"}
-
-
-
 
 
 # ═══════════════════════════════════════════════════════════
@@ -3737,6 +4351,25 @@ async def _docker_clean_parent_identity() -> dict:
             return {"ok": False, "error": f"清理身份文件失败: {e}"}
 
 
+async def _docker_restart_container(container_name: str) -> dict:
+    """Restart a Docker container via Unix socket API."""
+    if not os.path.exists(_DOCKER_SOCKET):
+        return {"ok": False, "error": "Docker socket not available"}
+    transport = httpx.AsyncHTTPTransport(uds=_DOCKER_SOCKET)
+    async with httpx.AsyncClient(transport=transport, timeout=30) as client:
+        try:
+            resp = await client.post(
+                f"http://localhost/containers/{container_name}/restart?t=3",
+            )
+            if resp.status_code == 404:
+                return {"ok": False, "error": f"容器 {container_name} 未找到"}
+            resp.raise_for_status()
+            logger.info("Container %s restarted successfully", container_name)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": f"重启容器失败: {e}"}
+
+
 @app.post("/api/bot/rebind_parent")
 async def rebind_parent():
     """清除父网关凭据，触发下次启动时重新绑定.
@@ -3756,8 +4389,9 @@ async def rebind_parent():
             with open(env_path, "w", encoding="utf-8") as f:
                 for line in lines:
                     stripped = line.strip()
-                    if (stripped.startswith("WEIXIN_TOKEN=") or
-                            stripped.startswith("WEIXIN_ACCOUNT_ID=")):
+                    if stripped.startswith("WEIXIN_TOKEN=") or stripped.startswith(
+                        "WEIXIN_ACCOUNT_ID="
+                    ):
                         f.write(line.split("=")[0] + "=\n")
                     else:
                         f.write(line)
@@ -3783,7 +4417,9 @@ async def bootstrap_parent_status():
     if os.path.exists("/data/hermes/.parent_identity.json"):
         return {"ok": True, "bound": True, "source": "identity_file"}
     # 3. 重启哨兵存在 (cron 已完成处理)
-    if os.path.exists("/data/platform/.parent_bootstrap_restarted"):
+    if os.path.exists("/data/platform/.parent_bootstrap_restarted") or os.path.exists(
+        "/data/platform/.parent_bootstrap_complete"
+    ):
         return {"ok": True, "bound": True, "source": "sentinel"}
     # 4. 结果文件存在且包含凭据 (正在扫码等待中或 cron 尚未处理)
     result_file = "/data/hermes/.parent_bootstrap_result.json"
@@ -3794,7 +4430,262 @@ async def bootstrap_parent_status():
             return {"ok": True, "bound": bool(creds.get("token", ""))}
         except (json.JSONDecodeError, OSError):
             return {"ok": True, "bound": False}
-    return {"ok": True, "bound": False}
+    # 5. Not bound — return in-memory bootstrap state
+    async with _bootstrap_lock:
+        bs = dict(_bootstrap_state)
+    resp = {"ok": True, "bound": False, "bootstrap": bs}
+    if bs["status"] == "qr_ready" and bs["qr_created_at"] > 0:
+        elapsed = time.monotonic() - bs["qr_created_at"]
+        resp["bootstrap"]["qr_expired"] = elapsed > _BOOTSTRAP_QR_TTL
+        resp["bootstrap"]["qr_remaining"] = max(0, _BOOTSTRAP_QR_TTL - int(elapsed))
+    return resp
+
+
+async def _docker_exec_bootstrap_parent() -> dict:
+    """Run qr_login for parent in hermes_agent via Docker API, return QR text."""
+    if not os.path.exists(_DOCKER_SOCKET):
+        return {
+            "ok": False,
+            "error": "Docker socket not available, cannot bootstrap parent gateway",
+        }
+    transport = httpx.AsyncHTTPTransport(uds=_DOCKER_SOCKET)
+    async with httpx.AsyncClient(transport=transport, timeout=120) as client:
+        create_resp = await client.post(
+            f"http://localhost/containers/{_HERMES_CONTAINER}/exec",
+            json={
+                "Cmd": [
+                    "python3",
+                    "-c",
+                    _make_qr_login_script("/opt/data", ".parent_identity.json"),
+                ],
+                "AttachStdout": True,
+                "AttachStderr": True,
+            },
+        )
+        if create_resp.status_code == 404:
+            return {
+                "ok": False,
+                "error": f"容器 {_HERMES_CONTAINER} 未找到，请确认 hermes_agent 正在运行",
+            }
+        create_resp.raise_for_status()
+        exec_id = create_resp.json()["Id"]
+
+        stream_buf = _DockerStreamBuf()
+        stderr_text = ""
+        qr_text: str | None = None
+        try:
+            async with asyncio.timeout(25):
+                async with client.stream(
+                    "POST",
+                    f"http://localhost/exec/{exec_id}/start",
+                    json={"Detach": False, "Tty": False},
+                ) as stream:
+                    async for chunk in stream.aiter_bytes():
+                        if qr_text:
+                            break
+                        frames = stream_buf.feed(chunk)
+                        for stype, sdata in frames:
+                            if stype == 2:
+                                stderr_text += sdata.decode("utf-8", errors="replace")
+                                for line in stderr_text.split("\n"):
+                                    line_s = line.strip()
+                                    if (
+                                        line_s.startswith("https://")
+                                        and "://" in line_s
+                                        and len(line_s) > 10
+                                    ):
+                                        qr_text = line_s
+                                        break
+                            if qr_text:
+                                break
+        except asyncio.TimeoutError:
+            pass
+
+        if not qr_text:
+            detail = (stderr_text or "无输出")[:300]
+            return {"ok": False, "error": f"qr_login 未输出有效二维码: {detail}"}
+
+        return {"ok": True, "qr_text": qr_text}
+
+
+async def _wait_parent_bootstrap():
+    """Background task: wait for parent identity file, then restart hermes_agent."""
+    identity_file = "/data/hermes/.parent_identity.json"
+    sentinel_file = "/data/platform/.parent_bootstrap_complete"
+    try:
+        for _ in range(150):  # 5 minutes max
+            await asyncio.sleep(2)
+            # Skip if another task already handled it
+            async with _bootstrap_lock:
+                if _bootstrap_state["status"] in ("bound", "restarting"):
+                    return
+            if os.path.exists(identity_file):
+                async with _bootstrap_lock:
+                    if _bootstrap_state["status"] in ("bound", "restarting"):
+                        return
+                    _bootstrap_state["status"] = "restarting"
+                logger.info("Parent identity detected, restarting hermes_agent...")
+                result = await _docker_restart_container(_HERMES_CONTAINER)
+                # Retry once on failure
+                if not result.get("ok"):
+                    logger.warning("Parent restart failed, retrying... (%s)", result.get("error"))
+                    await asyncio.sleep(3)
+                    result = await _docker_restart_container(_HERMES_CONTAINER)
+                async with _bootstrap_lock:
+                    if result.get("ok"):
+                        _bootstrap_state["status"] = "bound"
+                        _bootstrap_state["qr_url"] = ""
+                        logger.info("Parent bootstrap complete, hermes_agent restarted")
+                        try:
+                            os.makedirs(os.path.dirname(sentinel_file), exist_ok=True)
+                            with open(sentinel_file, "w") as f:
+                                f.write("ok")
+                        except OSError:
+                            pass
+                    else:
+                        _bootstrap_state["status"] = "error"
+                        _bootstrap_state["error"] = result.get("error", "重启 hermes_agent 失败")
+                return
+        async with _bootstrap_lock:
+            _bootstrap_state["status"] = "error"
+            _bootstrap_state["error"] = "等待扫码超时（5分钟）"
+    except Exception as e:
+        async with _bootstrap_lock:
+            _bootstrap_state["status"] = "error"
+            _bootstrap_state["error"] = str(e)
+
+
+async def _wait_child_bootstrap():
+    """Background task: wait for child identity file, then restart hermes_agent.
+
+    Child identity is created by qr_login inside Docker exec after the child
+    scans the QR. This function detects the identity file and restarts
+    hermes_agent so gateway_start.sh loads the child gateway with credentials.
+    Protected by _child_bootstrap_lock to prevent duplicate restarts.
+    """
+    identity_file = "/data/hermes_child/.child_identity.json"
+    try:
+        for _ in range(150):  # 5 minutes max (iLink QR TTL is 480s)
+            await asyncio.sleep(2)
+            # Skip if another task already handled it
+            async with _child_bootstrap_lock:
+                if _child_bootstrap_state["status"] in ("bound", "restarting"):
+                    return
+            if os.path.exists(identity_file):
+                async with _child_bootstrap_lock:
+                    if _child_bootstrap_state["status"] in ("bound", "restarting"):
+                        return
+                    _child_bootstrap_state["status"] = "restarting"
+                logger.info("Child identity detected, restarting hermes_agent...")
+                # Retry restart once on failure
+                result = await _docker_restart_container(_HERMES_CONTAINER)
+                if not result.get("ok"):
+                    logger.warning(
+                        "Child bootstrap restart failed, retrying... (%s)", result.get("error")
+                    )
+                    await asyncio.sleep(3)
+                    result = await _docker_restart_container(_HERMES_CONTAINER)
+                async with _child_bootstrap_lock:
+                    if result.get("ok"):
+                        _child_bootstrap_state["status"] = "bound"
+                        logger.info("Child bootstrap complete, hermes_agent restarted")
+                    else:
+                        _child_bootstrap_state["status"] = "error"
+                        _child_bootstrap_state["error"] = result.get(
+                            "error", "重启 hermes_agent 失败"
+                        )
+                return
+        async with _child_bootstrap_lock:
+            _child_bootstrap_state["status"] = "error"
+            _child_bootstrap_state["error"] = "等待孩子扫码超时（5分钟）"
+    except Exception as e:
+        async with _child_bootstrap_lock:
+            _child_bootstrap_state["status"] = "error"
+            _child_bootstrap_state["error"] = str(e)
+
+
+@app.post("/api/bot/bootstrap_parent")
+async def bootstrap_parent():
+    """生成父网关扫码绑定二维码（首次配置向导）.
+
+    1. Docker exec 在 hermes_agent 中运行 qr_login('/opt/data')
+    2. 从 stderr 流式读取二维码 URL，生成二维码图片返回
+    3. 后台等待身份文件出现后自动重启 hermes_agent
+
+    注意: QR 码每次从 iLink 实时生成，保证最新不过期缓存.
+    """
+    async with _bootstrap_lock:
+        if os.getenv("WEIXIN_TOKEN", "").strip() or os.path.exists(
+            "/data/hermes/.parent_identity.json"
+        ):
+            return {"ok": False, "bound": True, "error": "父网关已绑定"}
+
+        # Reuse existing QR if still fresh
+        if (
+            _bootstrap_state["status"] == "qr_ready"
+            and _bootstrap_state["qr_created_at"] > 0
+            and _bootstrap_state.get("qr_url")
+        ):
+            elapsed = time.monotonic() - _bootstrap_state["qr_created_at"]
+            if elapsed < _BOOTSTRAP_QR_TTL:
+                qr_scan_data = _bootstrap_state["qr_url"]
+                try:
+                    from io import BytesIO
+
+                    import qrcode as _qrlib
+
+                    _qr = _qrlib.QRCode(box_size=8, border=2)
+                    _qr.add_data(qr_scan_data)
+                    _qr.make(fit=True)
+                    img = _qr.make_image(fill_color="black", back_color="white")
+                    buf = BytesIO()
+                    img.save(buf, format="PNG")
+                    return Response(content=buf.getvalue(), media_type="image/png")
+                except Exception:
+                    pass  # fall through to generate fresh
+
+        # Start fresh bootstrap
+        _qr_code_cache.clear()
+        _bootstrap_state["status"] = "generating"
+        _bootstrap_state["qr_created_at"] = time.monotonic()
+        _bootstrap_state["qr_url"] = ""
+        _bootstrap_state["error"] = ""
+
+    # Outside lock: execute Docker exec (I/O bound, may take ~25s)
+    result = await _docker_exec_bootstrap_parent()
+
+    async with _bootstrap_lock:
+        if not result.get("ok"):
+            _bootstrap_state["status"] = "error"
+            _bootstrap_state["error"] = result.get("error", "未知错误")
+            return {"ok": False, "error": result.get("error", "生成二维码失败")}
+
+        qr_scan_data = result["qr_text"]
+        _bootstrap_state["qr_url"] = qr_scan_data
+        _bootstrap_state["status"] = "qr_ready"
+
+    # Start background watcher (identity file → restart container)
+    asyncio.create_task(_wait_parent_bootstrap())
+
+    try:
+        from io import BytesIO
+
+        import qrcode as _qrlib
+
+        _qr = _qrlib.QRCode(box_size=8, border=2)
+        _qr.add_data(qr_scan_data)
+        _qr.make(fit=True)
+        img = _qr.make_image(fill_color="black", back_color="white")
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
+    except ImportError:
+        return {"ok": True, "url": qr_scan_data, "text_only": True}
+    except Exception as e:
+        async with _bootstrap_lock:
+            _bootstrap_state["status"] = "error"
+            _bootstrap_state["error"] = f"生成二维码图片失败: {e}"
+        return {"ok": False, "error": f"生成二维码图片失败: {e}"}
 
 
 @app.get("/health")
@@ -3818,6 +4709,31 @@ async def health():
         except Exception:
             pass
     return response
+
+
+@app.get("/api/device/mdns/status")
+async def mdns_status():
+    import subprocess
+
+    avahi_alive = False
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", "avahi-publish-service"],
+            capture_output=True,
+            timeout=5,
+        )
+        avahi_alive = r.returncode == 0
+    except Exception:
+        pass
+    import threading
+
+    zeroconf_alive = any(t.name == "mdns-zeroconf" and t.is_alive() for t in threading.enumerate())
+    return {
+        "ok": True,
+        "hostname": _MDNS_HOSTNAME,
+        "ip": _DEVICE_IP or "",
+        "engines": {"avahi": avahi_alive, "zeroconf": zeroconf_alive},
+    }
 
 
 def run_provider_api(port: int = 8100):
