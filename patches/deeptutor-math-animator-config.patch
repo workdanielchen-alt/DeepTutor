@@ -1,5 +1,5 @@
---- a/vendor/deeptutor/deeptutor/capabilities/math_animator.py
-+++ b/vendor/deeptutor/deeptutor/capabilities/math_animator.py
+--- a/deeptutor/capabilities/math_animator.py
++++ b/deeptutor/capabilities/math_animator.py
 @@ -53,7 +53,10 @@
          from deeptutor.services.llm.config import get_llm_config
 

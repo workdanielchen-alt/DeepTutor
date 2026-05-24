@@ -1,0 +1,4 @@
+[submodule "vendor/deeptutor"]
+	path = vendor/deeptutor
+	url = https://github.com/workdanielchen-alt/DeepTutor.git
+	branch = main

@@ -1,5 +1,5 @@
---- a/vendor/deeptutor/deeptutor/services/config/provider_runtime.py
-+++ b/vendor/deeptutor/deeptutor/services/config/provider_runtime.py
+--- a/deeptutor/services/config/provider_runtime.py
++++ b/deeptutor/services/config/provider_runtime.py
 @@ -128,6 +128,15 @@
          keywords=("vllm", "lmstudio"),
          is_local=True,
