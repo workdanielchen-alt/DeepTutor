@@ -37,7 +37,7 @@ COPY web/ ./
 
 # Provide the single source of truth for the app version so next.config.js
 # can read it during ``npm run build`` and inline it into the bundle.
-COPY deeptutor/__version__.py /app/deeptutor/__version__.py
+COPY vendor/deeptutor/deeptutor/__version__.py /app/deeptutor/__version__.py
 
 # Build-time env vars — passed as build args from docker-compose.yml
 # or use the defaults below for standalone builds (docker build --no-build-arg).
@@ -154,8 +154,8 @@ COPY --from=frontend-builder /app/web/.next/static/ ./web/.next/static/
 COPY --from=frontend-builder /app/web/public/ ./web/public/
 
 # Copy application source code
-COPY deeptutor/ ./deeptutor/
-COPY deeptutor_cli/ ./deeptutor_cli/
+COPY vendor/deeptutor/deeptutor/ ./deeptutor/
+COPY vendor/deeptutor/deeptutor_cli/ ./deeptutor_cli/
 COPY scripts/ ./scripts/
 COPY pyproject.toml ./
 COPY requirements/ ./requirements/

@@ -5,7 +5,6 @@ ROOT = Path(__file__).resolve().parents[2]
 VENDOR = ROOT / "vendor" / "deeptutor"
 PROVIDER_CMD = (VENDOR / "deeptutor_cli" / "provider_cmd.py").read_text(encoding="utf-8")
 CLI_README = (VENDOR / "deeptutor_cli" / "README.md").read_text(encoding="utf-8")
-ROOT_README = (ROOT / "README.md").read_text(encoding="utf-8")
 
 
 class ProviderCliDocsContractTest(unittest.TestCase):
@@ -22,14 +21,9 @@ class ProviderCliDocsContractTest(unittest.TestCase):
 
     def test_readmes_match_the_cli_contract(self) -> None:
         self.assertIn(
-            "Provider auth (`openai-codex` OAuth login; `github-copilot` validates an existing Copilot auth session)",
-            ROOT_README,
-        )
-        self.assertIn(
             "deeptutor provider login github-copilot    # 校验现有 GitHub Copilot 认证是否可用",
             CLI_README,
         )
-        self.assertNotIn("OAuth login (`openai-codex`, `github-copilot`)", ROOT_README)
 
 
 if __name__ == "__main__":
