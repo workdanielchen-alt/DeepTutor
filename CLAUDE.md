@@ -6,7 +6,11 @@
 
 | 目录 | 说明 |
 |------|------|
-| `deeptutor/` | 教学引擎核心，后续开发保持不改 |
+| 目录 | 说明 |
+|------|------|
+| `vendor/deeptutor/deeptutor/` | 教学引擎核心 (HKUDS/DeepTutor)，不直接修改 |
+| `vendor/deeptutor/deeptutor_cli/` | CLI 层 (HKUDS/DeepTutor)，不直接修改 |
+| `vendor/deeptutor/deeptutor_web/` | Web 包 (HKUDS/DeepTutor)，不直接修改 |
 | `tests/` | 不擅自修改已有测试；新功能需同步增加对应测试 |
 
 ### 🟡 尽量少改 (改必有 patch)
@@ -15,17 +19,47 @@
 |------|------|
 | `vendor/hermes-agent/` | 微信 iLink 双网关 |
 
-如需修改 hermes-agent：
+如需修改 vendor 代码：
 1. 优先用外部配置 (`config/`) 实现
 2. 必须改源码时，用 patch 文件追踪：
-   - `git diff vendor/hermes-agent/xxx.py > patches/xxx.patch`
+   - `git diff vendor/xxx.py > patches/xxx.patch`
    - 升级后用 `git apply patches/xxx.patch` 快速恢复
 3. 不改函数签名，不封装接口层
 
+当前已有 patch 文件：
+- `patches/deeptutor-math-animator-config.patch` — math_animator 配置兼容
+- `patches/deeptutor-rkllama-embedding.patch` — rkllama embedding provider
+
 ### 🟢 可正常修改 (项目自有代码)
 
-`docker/platform/` `tutor_platform/` `domains/` `web/` `scripts/` `docker-compose*.yml`
+`docker/platform/` `tutor_platform/` `domains/` `web/` `scripts/` `patches/` `docker-compose*.yml`
 `ARCHITECTURE.md` `PRD.md` `CLAUDE.md`
+
+## 4. 上游代码升级流程 (vendor/deeptutor)
+
+```bash
+# 1. 拉取最新上游代码
+git fetch upstream
+
+# 2. 将上游变更复制到 vendor（upstream 仍是原始路径）
+git checkout upstream/main -- deeptutor/ deeptutor_cli/ deeptutor_web/
+cp -a deeptutor/* vendor/deeptutor/deeptutor/
+cp -a deeptutor_cli/* vendor/deeptutor/deeptutor_cli/
+cp -a deeptutor_web/* vendor/deeptutor/deeptutor_web/
+
+# 3. 恢复本地 patch
+git apply patches/*.patch
+
+# 4. 重新注册可编辑安装
+pip install -e .
+
+# 5. 清理临时文件
+git checkout -- deeptutor/ deeptutor_cli/ deeptutor_web/  # 还原根目录副本
+
+# 6. 验证
+python -c "from deeptutor.app import DeepTutorApp; print('OK')"
+pytest tests/ -x -q
+```
 
 ## 2. 分支策略
 

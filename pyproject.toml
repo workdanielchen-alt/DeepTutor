@@ -170,7 +170,7 @@ include-package-data = true
 version = {attr = "deeptutor.__version__.__version__"}
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = [".", "vendor/deeptutor"]
 include = ["deeptutor*", "deeptutor_cli*"]
 
 [tool.setuptools.package-data]
@@ -343,7 +343,7 @@ max-complexity = 10
 # ============================================
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "vendor/deeptutor"]
 markers = [
     "asyncio: mark async tests that require pytest-asyncio",
 ]

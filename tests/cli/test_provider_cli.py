@@ -2,8 +2,9 @@ from pathlib import Path
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-PROVIDER_CMD = (ROOT / "deeptutor_cli" / "provider_cmd.py").read_text(encoding="utf-8")
-CLI_README = (ROOT / "deeptutor_cli" / "README.md").read_text(encoding="utf-8")
+VENDOR = ROOT / "vendor" / "deeptutor"
+PROVIDER_CMD = (VENDOR / "deeptutor_cli" / "provider_cmd.py").read_text(encoding="utf-8")
+CLI_README = (VENDOR / "deeptutor_cli" / "README.md").read_text(encoding="utf-8")
 ROOT_README = (ROOT / "README.md").read_text(encoding="utf-8")
 
 

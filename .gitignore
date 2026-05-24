@@ -295,7 +295,6 @@ celerybeat.pid
 # ============================================
 # Dev runtime data (not to be confused with data/ above)
 data_dev/
-patches/
 test_data/
 tutor_platform_restored/
 

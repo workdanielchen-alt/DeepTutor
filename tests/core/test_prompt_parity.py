@@ -7,11 +7,12 @@ from typing import Any, Iterable
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-AGENTS_DIR = PROJECT_ROOT / "deeptutor" / "agents"
+VENDOR = PROJECT_ROOT / "vendor" / "deeptutor"
+AGENTS_DIR = VENDOR / "deeptutor" / "agents"
 # Modules that live outside deeptutor/agents/ but still own prompts.
 EXTRA_PROMPT_MODULE_DIRS = (
-    PROJECT_ROOT / "deeptutor" / "book",
-    PROJECT_ROOT / "deeptutor" / "co_writer",
+    VENDOR / "deeptutor" / "book",
+    VENDOR / "deeptutor" / "co_writer",
 )
 
 # Template placeholders are expected to be like {topic}, {knowledge_title}, etc.

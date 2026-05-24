@@ -8,13 +8,8 @@ import types
 
 
 def _load_question_extractor_module():
-    module_path = (
-        Path(__file__).resolve().parents[2]
-        / "deeptutor"
-        / "tools"
-        / "question"
-        / "question_extractor.py"
-    )
+    vendor = Path(__file__).resolve().parents[2] / "vendor" / "deeptutor"
+    module_path = vendor / "deeptutor" / "tools" / "question" / "question_extractor.py"
 
     stubbed_modules = {
         "deeptutor.services.config": {"get_agent_params": lambda *_args, **_kwargs: {}},
