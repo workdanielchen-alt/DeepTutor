@@ -52,6 +52,7 @@ from domains.tutoring.mastery import (
     update_mastery,
     weak_points,
 )
+from tutor_platform.quiz_sync import sync_quiz_to_mastery
 from tutor_platform.storage import validate_provider_config
 from tutor_platform.unified_provider import (
     UnifiedLocalProvider,
@@ -110,6 +111,27 @@ _provider_error: str | None = None
 _session_msg_since_cleanup = 0
 SESSION_CLEANUP_THRESHOLD = int(os.getenv("SESSION_CLEANUP_THRESHOLD", "2000"))
 
+# File process cache: (sha256:learner_id) → (timestamp, result_dict)
+# Deduplicates repeated uploads of the same file by the same learner.
+_FILE_PROCESS_CACHE: dict[str, tuple[float, dict]] = {}
+_FILE_CACHE_MAX = 100
+_FILE_CACHE_TTL_S = 1800  # 30 min
+
+
+def _hash_file(file_path: str) -> str:
+    """Return SHA-256 hex digest of file contents."""
+    import hashlib
+
+    sha = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
 # Tutor context cache: keys learner_id → last non-empty context string.
 # When _tutor_chat_core receives a follow-up call (context="") from the
 # Phase C protocol handler (e.g. student answers "B"), the cached context
@@ -121,6 +143,20 @@ _MAX_CACHED_CONTEXTS = 100
 # output (e.g. "第5题"). Used by auto-next to send explicit "请出第N+1题"
 # instead of ambiguous "下一题" — prevents LLM miscounting/skipping.
 _last_question_num: dict[str, int] = {}
+
+# Correct answer key per learner: stores the most recent correct answer
+# extracted from DT's [ANSWER_KEY:X] marker.  Injected into SOUL.md on
+# the next turn so the LLM sees the correct answer in its system prompt.
+_answer_keys: dict[str, str] = {}
+
+# Per-learner KP name parsed from DT's 【知识点：XXX】 marker, stored after
+# each question is asked.  Used for mastery recording on the next turn when
+# the student answers.
+_kp_names: dict[str, str] = {}
+
+# Last question text per learner: extracted from DT response after 【第X题】,
+# stored so the next turn's update_mastery() call records the real question.
+_last_question_text: dict[str, str] = {}
 
 # DT LLM profile cache: tracks currently active (profile_id, model_id) so
 # _tutor_chat_core can skip redundant catalog switches + bot restarts.
@@ -298,6 +334,9 @@ def _save_ocr_warmed():
 # Last SOUL.md content per learner: skip redundant updates when unchanged.
 _last_soul_content: dict[str, str] = {}
 
+# Full persona text cache per learner: avoid HTTP PATCH when persona unchanged.
+_last_persona: dict[str, str] = {}
+
 _CONTEXT_PERSIST_DIR = os.getenv("MASTERY_DIR", "/data/mastery")
 
 
@@ -401,26 +440,152 @@ async def _get_provider() -> UnifiedLocalProvider:
         return await _init_provider()
 
 
+# Unified extension list: mirrors FileTypeRouter (vendor/deeptutor/deeptutor/services/rag/file_routing.py)
+# plus platform-specific extras (.doc/.ppt/.pps/.pptm/.ppsx/.xls).
+# Keep in sync when upstream adds new extensions.
 ALLOWED_EXTENSIONS = frozenset(
     {
+        # ── Parser (Office + PDF) ──
         ".pdf",
         ".docx",
-        ".doc",
-        ".pptx",
-        ".ppt",
-        ".txt",
-        ".md",
-        ".html",
-        ".htm",
-        ".rst",
         ".xlsx",
+        ".pptx",
+        # ── Platform extras (beyond FileTypeRouter) ──
+        ".doc",
+        ".ppt",
+        ".pps",
+        ".pptm",
+        ".ppsx",
         ".xls",
-        ".csv",
+        # ── Images ──
         ".jpg",
         ".jpeg",
         ".png",
+        ".gif",
         ".webp",
         ".bmp",
+        ".tiff",
+        ".tif",
+        # ── Plain text & docs ──
+        ".txt",
+        ".text",
+        ".log",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".asciidoc",
+        # ── Data / config ──
+        ".json",
+        ".jsonc",
+        ".json5",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".csv",
+        ".tsv",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".env",
+        ".properties",
+        # ── Typesetting ──
+        ".tex",
+        ".latex",
+        ".bib",
+        # ── JavaScript / TypeScript ──
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".mts",
+        ".cts",
+        ".jsx",
+        ".tsx",
+        # ── Web frameworks ──
+        ".vue",
+        ".svelte",
+        # ── Python ──
+        ".py",
+        # ── JVM ──
+        ".java",
+        ".kt",
+        ".kts",
+        ".scala",
+        ".groovy",
+        ".gradle",
+        # ── Systems ──
+        ".c",
+        ".h",
+        ".cpp",
+        ".cc",
+        ".cxx",
+        ".hpp",
+        ".hh",
+        ".hxx",
+        ".cs",
+        ".go",
+        ".rs",
+        ".zig",
+        ".nim",
+        # ── Apple platforms ──
+        ".swift",
+        ".m",
+        ".mm",
+        # ── Scripting ──
+        ".rb",
+        ".php",
+        ".pl",
+        ".pm",
+        ".lua",
+        ".r",
+        ".jl",
+        ".dart",
+        # ── Functional ──
+        ".hs",
+        ".clj",
+        ".cljs",
+        ".cljc",
+        ".ex",
+        ".exs",
+        ".erl",
+        ".ml",
+        ".mli",
+        ".fs",
+        ".fsx",
+        ".lisp",
+        ".lsp",
+        ".scm",
+        ".rkt",
+        # ── Web markup / styles ──
+        ".html",
+        ".htm",
+        ".xml",
+        ".svg",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
+        # Smart contracts
+        ".sol",
+        # Shells / editors
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".fish",
+        ".ps1",
+        ".vim",
+        # Query / IDL
+        ".sql",
+        ".graphql",
+        ".gql",
+        ".proto",
+        # Build / infra
+        ".cmake",
+        ".mk",
+        ".tf",
+        ".hcl",
+        ".nginxconf",
+        ".dockerfile",
     }
 )
 MAX_FILE_SIZE = 100 * 1024 * 1024
@@ -593,6 +758,9 @@ _trace_id_counter: int = 0
 
 
 async def _warm_ocr_model(trace_id: str = ""):
+    if os.getenv("OCR_PROVIDER", "rkllama") == "ollama":
+        logger.info("[%s] OCR warm skipped (Ollama loads on demand)", trace_id)
+        return
     try:
         rkllama_url = os.getenv("RKLLAMA_URL", "http://rkllama:8080")
         async with httpx.AsyncClient(timeout=10) as client:
@@ -612,9 +780,116 @@ async def _warm_ocr_model(trace_id: str = ""):
         logger.debug("[%s] OCR warm failed (non-critical): %s", trace_id, e)
 
 
-_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp"})
-_TEXT_EXTENSIONS = frozenset({".txt", ".md", ".html", ".htm", ".rst", ".csv"})
-_OFFICE_EXTENSIONS = frozenset({".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls"})
+_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif"})
+_TEXT_EXTENSIONS = frozenset(
+    {
+        # Mirrors FileTypeRouter.TEXT_EXTENSIONS (vendor/deeptutor/.../file_routing.py)
+        ".txt",
+        ".text",
+        ".log",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".asciidoc",
+        ".json",
+        ".jsonc",
+        ".json5",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".csv",
+        ".tsv",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".env",
+        ".properties",
+        ".tex",
+        ".latex",
+        ".bib",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".mts",
+        ".cts",
+        ".jsx",
+        ".tsx",
+        ".vue",
+        ".svelte",
+        ".py",
+        ".java",
+        ".kt",
+        ".kts",
+        ".scala",
+        ".groovy",
+        ".gradle",
+        ".c",
+        ".h",
+        ".cpp",
+        ".cc",
+        ".cxx",
+        ".hpp",
+        ".hh",
+        ".hxx",
+        ".cs",
+        ".go",
+        ".rs",
+        ".zig",
+        ".nim",
+        ".swift",
+        ".m",
+        ".mm",
+        ".rb",
+        ".php",
+        ".pl",
+        ".pm",
+        ".lua",
+        ".r",
+        ".jl",
+        ".dart",
+        ".hs",
+        ".clj",
+        ".cljs",
+        ".cljc",
+        ".ex",
+        ".exs",
+        ".erl",
+        ".ml",
+        ".mli",
+        ".fs",
+        ".fsx",
+        ".lisp",
+        ".lsp",
+        ".scm",
+        ".rkt",
+        ".html",
+        ".htm",
+        ".xml",
+        ".svg",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
+        ".sol",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".fish",
+        ".ps1",
+        ".vim",
+        ".sql",
+        ".graphql",
+        ".gql",
+        ".proto",
+        ".cmake",
+        ".mk",
+        ".tf",
+        ".hcl",
+        ".nginxconf",
+        ".dockerfile",
+    }
+)
 
 
 async def _handle_inbound_file(
@@ -629,7 +904,8 @@ async def _handle_inbound_file(
         ├─ Image (.jpg/.png/…) → OpenCV preprocess → rkllama OCR
         ├─ Text (.txt/.md/…)   → direct read
         ├─ PDF
-        │   ├─ Has text layer  → markitdown extract
+        │   ├─ Has text layer  → pymupdf extract (primary)
+        │   ├─ Sparse text     → markitdown extract (fallback)
         │   └─ Scanned         → render page(s) → OpenCV → rkllama OCR
         ├─ Office (.docx/.pptx/…) → markitdown extract
         ├─ Old .doc            → antiword extract
@@ -644,31 +920,58 @@ async def _handle_inbound_file(
     if not os.path.isfile(file_path):
         return {"ok": False, "error": f"File not found: {file_path}"}
 
+    # ── Dedup: skip if same file was recently processed for this learner ──
+    _fhash = _hash_file(file_path)
+    _ckey = f"{_fhash}:{learner_id}"
+    if _ckey in _FILE_PROCESS_CACHE:
+        _fts, _fresult = _FILE_PROCESS_CACHE[_ckey]
+        if time.time() - _fts < _FILE_CACHE_TTL_S:
+            logger.info(
+                "[%s] Cache hit: %s (learner=%s, age=%.0fs)",
+                trace_id,
+                file_path,
+                learner_id,
+                time.time() - _fts,
+            )
+            return _fresult
+
+    def _cache_res(result: dict) -> dict:
+        """Store result in LRU cache and evict oldest if over limit."""
+        _FILE_PROCESS_CACHE[_ckey] = (time.time(), result)
+        if len(_FILE_PROCESS_CACHE) > _FILE_CACHE_MAX:
+            # Remove oldest entry (the dict preserves insertion order in 3.7+)
+            _FILE_PROCESS_CACHE.pop(next(iter(_FILE_PROCESS_CACHE)))
+        return result
+
     try:
         # ── Image files: OpenCV preprocess → rkllama OCR ──
         if ext in _IMAGE_EXTENSIONS:
             content = await _ocr_image_file(file_path, trace_id)
             if content:
                 logger.info("[%s] OCR success: %d chars from %s", trace_id, len(content), file_path)
-                return {
-                    "ok": True,
-                    "content": content,
-                    "intent": "EDUCATION",
-                    "route": "ocr",
-                    "storage": {"ok": False},
-                }
+                return _cache_res(
+                    {
+                        "ok": True,
+                        "content": content,
+                        "intent": "EDUCATION",
+                        "route": "ocr",
+                        "storage": {"ok": False},
+                    }
+                )
             # OCR failed — descriptive fallback so DT Bot can guide user
             content = "用户通过微信发送了一张图片，但图片中的文字未能被自动识别。请用友好的语气请学生将题目文字直接输入发送过来。"
             logger.warning(
                 "[%s] OCR failed, using descriptive fallback for %s", trace_id, file_path
             )
-            return {
-                "ok": True,
-                "content": content,
-                "intent": "EDUCATION",
-                "route": "ocr_fallback",
-                "storage": {"ok": False},
-            }
+            return _cache_res(
+                {
+                    "ok": True,
+                    "content": content,
+                    "intent": "EDUCATION",
+                    "route": "ocr_fallback",
+                    "storage": {"ok": False},
+                }
+            )
 
         # ── Text files: read directly ──
         elif ext in _TEXT_EXTENSIONS:
@@ -677,13 +980,15 @@ async def _handle_inbound_file(
             # HTML 文件消毒: 剥离 script/style/event-handler
             if ext in {".html", ".htm"}:
                 content = _sanitize_html_content(content)
-            return {
-                "ok": True,
-                "content": content,
-                "intent": "EDUCATION" if len(content) < 5000 else "DOCUMENT",
-                "route": "text",
-                "storage": {"ok": False},
-            }
+            return _cache_res(
+                {
+                    "ok": True,
+                    "content": content,
+                    "intent": "EDUCATION" if len(content) < 5000 else "DOCUMENT",
+                    "route": "text",
+                    "storage": {"ok": False},
+                }
+            )
 
         # ── PDF: classify → text PDF (markitdown) or scanned (render→OCR) ──
         elif ext == ".pdf":
@@ -692,82 +997,130 @@ async def _handle_inbound_file(
                 logger.info(
                     "[%s] PDF extraction: %d chars from %s", trace_id, len(content), file_path
                 )
-                return {
-                    "ok": True,
-                    "content": content,
-                    "intent": "EDUCATION",
-                    "route": "document_extract",
-                    "storage": {"ok": False},
-                }
+                return _cache_res(
+                    {
+                        "ok": True,
+                        "content": content,
+                        "intent": "EDUCATION",
+                        "route": "document_extract",
+                        "storage": {"ok": False},
+                    }
+                )
             # Fallback to placeholder
             logger.warning("[%s] PDF extraction returned no content for %s", trace_id, file_path)
-            return _fallback_placeholder(file_path, ext)
+            return _cache_res(_fallback_placeholder(file_path, ext))
 
-        # ── Office docs (.docx/.pptx/.xlsx): markitdown ──
-        elif ext in {".docx", ".pptx", ".ppt", ".xlsx", ".xls"}:
-            content = _extract_with_markitdown(file_path)
+        # ── Everything else: try markitdown first (broadest coverage) ──
+        elif ext not in _IMAGE_EXTENSIONS and ext != ".pdf" and ext not in _TEXT_EXTENSIONS:
+            _temp_link = None
+            md_path = file_path
+            # markitdown rejects .pptm/.ppsx by extension; symlink as .pptx
+            if ext in {".pptm", ".ppsx"}:
+                _temp_link = file_path + ".pptx"
+                if not os.path.exists(_temp_link):
+                    os.symlink(file_path, _temp_link)
+                md_path = _temp_link
+            content = _extract_with_markitdown(md_path)
+            if _temp_link and os.path.exists(_temp_link):
+                os.unlink(_temp_link)
+
             if content:
                 logger.info(
                     "[%s] markitdown extracted %d chars from %s", trace_id, len(content), file_path
                 )
-                return {
-                    "ok": True,
-                    "content": content,
-                    "intent": "EDUCATION",
-                    "route": "document_extract",
-                    "storage": {"ok": False},
-                }
-            logger.warning("[%s] markitdown failed for %s", trace_id, file_path)
-            return _fallback_placeholder(file_path, ext)
+                # OCR embedded images in Office documents
+                ocr_text = await _ocr_office_images(file_path, ext, trace_id)
+                if ocr_text:
+                    content += ocr_text
+                return _cache_res(
+                    {
+                        "ok": True,
+                        "content": content,
+                        "intent": "EDUCATION",
+                        "route": "document_extract",
+                        "storage": {"ok": False},
+                    }
+                )
 
-        # ── Old .doc: antiword ──
-        elif ext == ".doc":
-            content = _extract_with_antiword(file_path)
+            # ── markitdown declined; try specialized fallbacks ──
+            if ext == ".doc":
+                content = _extract_with_antiword(file_path)
+            elif ext in {".ppt", ".pps"}:
+                content = _extract_with_catppt(file_path)
+
             if content:
                 logger.info(
-                    "[%s] antiword extracted %d chars from %s", trace_id, len(content), file_path
+                    "[%s] fallback extracted %d chars from %s", trace_id, len(content), file_path
                 )
-                return {
-                    "ok": True,
-                    "content": content,
-                    "intent": "EDUCATION",
-                    "route": "document_extract",
-                    "storage": {"ok": False},
-                }
-            logger.warning("[%s] antiword failed for %s", trace_id, file_path)
-            return _fallback_placeholder(file_path, ext)
+                # OCR embedded images in old-format Office documents
+                ocr_text = await _ocr_office_images(file_path, ext, trace_id)
+                if ocr_text:
+                    content += ocr_text
 
-        # ── Unknown extension ──
+                # LibreOffice conversion for old .doc/.ppt (equations, embedded objects)
+                lo_text = await _ocr_old_doc_with_libreoffice(file_path, trace_id)
+                if lo_text:
+                    content += "\n\n" + lo_text
+
+            if content:
+                return _cache_res(
+                    {
+                        "ok": True,
+                        "content": content,
+                        "intent": "EDUCATION",
+                        "route": "document_extract",
+                        "storage": {"ok": False},
+                    }
+                )
+
+            # Last resort: LibreOffice for old .doc/.ppt with equations
+            if ext in {".doc", ".ppt", ".pps"}:
+                lo_text = await _ocr_old_doc_with_libreoffice(file_path, trace_id)
+                if lo_text:
+                    return _cache_res(
+                        {
+                            "ok": True,
+                            "content": lo_text,
+                            "intent": "EDUCATION",
+                            "route": "document_extract",
+                            "storage": {"ok": False},
+                        }
+                    )
+
+            logger.warning("[%s] all extractors failed for %s", trace_id, file_path)
+            return _cache_res(_fallback_placeholder(file_path, ext))
+
+        # ── Unknown (non-office, non-image, non-text) ──
         else:
-            return _fallback_placeholder(file_path, ext)
+            return _cache_res(_fallback_placeholder(file_path, ext))
 
     except Exception as e:
         logger.error("[%s] handle_inbound_file error: %s", trace_id, e)
-        return {"ok": False, "error": str(e)}
+        return _cache_res({"ok": False, "error": str(e)})
 
 
 # ── PDF classification ──
 
 
-def _classify_pdf(file_path: str) -> tuple[str, int]:
-    """Classify a PDF as ``"text"`` or ``"scanned"``.
+def _extract_pdf_text(file_path: str) -> tuple[str, int]:
+    """Extract text from a PDF via pymupdf.
 
-    Returns ``(classification, num_pages)``.
-    ``"text"`` means at least one page has >50 chars of extractable text.
+    Returns ``(text, num_pages)``.  ``text`` is empty when the PDF has no
+    extractable text layer (scanned document).
     """
     import fitz
 
     doc = fitz.open(file_path)
     num_pages = len(doc)
-    total_text = 0
+    pages = []
     for page in doc:
-        total_text += len(page.get_text().strip())
+        pages.append(page.get_text().strip())
     doc.close()
-    classification = "text" if total_text > 50 else "scanned"
-    return classification, num_pages
+    text = "\n\n".join(pages).strip()
+    return text, num_pages
 
 
-def _render_pdf_page(file_path: str, page_num: int, dpi: int = 200) -> bytes:
+def _render_pdf_page(file_path: str, page_num: int, dpi: int = 300) -> bytes:
     """Render a PDF page to PNG image bytes."""
     import fitz
 
@@ -780,16 +1133,40 @@ def _render_pdf_page(file_path: str, page_num: int, dpi: int = 200) -> bytes:
 
 
 async def _handle_pdf(file_path: str, trace_id: str) -> str:
-    """Classify PDF → route to text extraction or page-by-page OCR."""
-    classification, num_pages = _classify_pdf(file_path)
-    logger.info(
-        "[%s] PDF classified as '%s' (%d pages, %s)", trace_id, classification, num_pages, file_path
-    )
+    """Extract text from a PDF.
 
-    if classification == "text":
-        return _extract_with_markitdown(file_path)
+    Priority order:
+      1. pymupdf direct text extraction (fast, handles text-layer PDFs)
+      2. Page-by-page OCR via rkllama (for scanned/image-only PDFs)
+      3. markitdown as fallback for edge cases pymupdf can't handle
+    """
+    text, num_pages = _extract_pdf_text(file_path)
+
+    # pymupdf found enough text → text-based PDF, return directly
+    if len(text) > 50:
+        logger.info(
+            "[%s] PDF text: %d chars from %d pages via pymupdf",
+            trace_id,
+            len(text),
+            num_pages,
+        )
+        return text
+
+    # pymupdf got very little text; try markitdown in case it can do better
+    # with a different text extraction strategy (e.g. complex layouts).
+    if text:
+        md_text = _extract_with_markitdown(file_path)
+        if md_text:
+            logger.info(
+                "[%s] PDF text: %d chars via markitdown (pymupdf had only %d)",
+                trace_id,
+                len(md_text),
+                len(text),
+            )
+            return md_text
 
     # Scanned PDF: render each page → OpenCV → OCR
+    logger.info("[%s] PDF classified as scanned (%d pages, %s)", trace_id, num_pages, file_path)
     pages_text: list[str] = []
     for i in range(num_pages):
         try:
@@ -809,8 +1186,11 @@ async def _handle_pdf(file_path: str, trace_id: str) -> str:
 
 def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
     """Preprocess image for OCR: deskew → denoise → enhance → threshold."""
-    import cv2
-    import numpy as np
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return image_bytes  # cv2 not available, use raw
 
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -866,10 +1246,77 @@ def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
 # ── OCR helpers ──
 
 
-async def _ocr_image_bytes(image_bytes: bytes, trace_id: str) -> str:
-    """Send preprocessed image bytes to rkllama OCR."""
-    import base64
+async def _ocr_image_bytes_ollama(image_bytes: bytes, trace_id: str) -> str:
+    """OCR via local Ollama (MiniCPM-V 4.6)."""
+    img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
+    model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6")
+    async with _ocr_semaphore:
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{ollama_url}/api/chat",
+                    json={
+                        "model": model,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "你是一个OCR文字识别引擎。只输出图片中实际存在的文字内容，不要添加任何描述、解释或额外文字。按阅读顺序逐字输出。如果有公式或数字，保持原样。",
+                            },
+                            {
+                                "role": "user",
+                                "content": "识别这张图片中的文字，只输出文字本身，不要任何其他内容：",
+                                "images": [img_b64],
+                            },
+                        ],
+                        "stream": False,
+                        "options": {"temperature": 0},
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    content = (data.get("message", {}).get("content", "") or "").strip()
+                    # Post-process: strip explanation prefixes common in MiniCPM responses
+                    for prefix in [
+                        "图片中的文字", "图片上的文字", "图片内容为", "图片内容是",
+                        "识别结果", "OCR结果", "OCR识别结果",
+                        "The OCR result", "The text in the image",
+                        "OCR recognition result",
+                    ]:
+                        if content.startswith(prefix):
+                            # Try to extract the quoted part or remaining text
+                            import re
+                            quoted = re.search(r'["""](.+)["""]', content)
+                            if quoted:
+                                content = quoted.group(1)
+                            else:
+                                content = content[len(prefix):].lstrip("：:，, ")
+                            break
+                    return content
+                logger.warning("[%s] Ollama OCR returned HTTP %s", trace_id, resp.status_code)
+        except Exception as exc:
+            logger.warning("[%s] Ollama OCR request failed: %s", trace_id, exc)
+    return ""
 
+
+async def _ocr_image_bytes(image_bytes: bytes, trace_id: str) -> str:
+    """OCR dispatch: rkllama or Ollama based on OCR_PROVIDER.
+
+    Result is validated — garbled output is treated as OCR failure (empty string).
+    """
+    provider = os.getenv("OCR_PROVIDER", "rkllama")
+    if provider == "ollama":
+        text = await _ocr_image_bytes_ollama(image_bytes, trace_id)
+    else:
+        text = await _ocr_image_bytes_rkllama(image_bytes, trace_id)
+
+    if text and _ocr_output_is_garbled(text):
+        logger.warning("[%s] OCR output garbled (%d chars), treating as failure", trace_id, len(text))
+        return ""
+    return text
+
+
+async def _ocr_image_bytes_rkllama(image_bytes: bytes, trace_id: str) -> str:
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
     rkllama_url = os.getenv("RKLLAMA_URL", "http://rkllama:8080")
     async with _ocr_semaphore:
@@ -893,13 +1340,88 @@ async def _ocr_image_bytes(image_bytes: bytes, trace_id: str) -> str:
     return ""
 
 
+_MIN_SEGMENT_H = 40      # minimum segment height in pixels
+_GAP_RATIO = 0.005       # minimum gap height relative to image height to split
+
+
+def _split_image_segments(image_bytes: bytes) -> list[bytes]:
+    """Split a page image at horizontal whitespace gaps.
+
+    Uses horizontal projection to detect text row gaps (blank lines between
+    questions/paragraphs).  Each segment is encoded as JPEG for OCR.
+
+    Returns the original image (single-element list) when no split is possible.
+    """
+    import cv2
+    import numpy as np
+
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return [image_bytes]
+
+    h, w = img.shape
+    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    proj = np.sum(binary, axis=1) // 255
+    threshold_px = max(1, int(w * 0.01))
+    content = proj > threshold_px
+
+    min_gap_h = max(5, int(h * _GAP_RATIO))
+    segments: list[bytes] = []
+    i = 0
+    while i < h:
+        if not content[i]:
+            i += 1
+            continue
+        start = i
+        while i < h and content[i]:
+            i += 1
+        end = i
+        gap_end = i
+        while gap_end < h and not content[gap_end]:
+            gap_end += 1
+        if gap_end - i >= min_gap_h and end - start >= _MIN_SEGMENT_H:
+            seg = img[max(0, start - 2): min(h, gap_end + 2)]
+            _, buf = cv2.imencode(".jpg", seg, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            segments.append(buf.tobytes())
+            i = gap_end
+
+    if len(segments) <= 1:
+        return [image_bytes]
+    return segments
+
+
 async def _ocr_image_file(file_path: str, trace_id: str) -> str:
-    """Read image file, OpenCV preprocess, then OCR."""
+    """Read image file, OpenCV preprocess, then OCR.
+
+    Full-page images are split at horizontal gaps (blank lines between
+    questions) and each segment is OCRed in parallel for speed.
+    """
     try:
         with open(file_path, "rb") as f:
             raw_bytes = f.read()
         processed = _opencv_preprocess_image(raw_bytes)
-        return await _ocr_image_bytes(processed, trace_id)
+
+        # Try full-image OCR first
+        text = await _ocr_image_bytes(processed, trace_id)
+        if text:
+            return text
+
+        # Full-image failed → split into horizontal segments and OCR in parallel
+        segments = _split_image_segments(processed)
+        if len(segments) <= 1:
+            return text
+
+        logger.info("[%s] Splitting image into %d segments for parallel OCR", trace_id, len(segments))
+        tasks = [_ocr_image_bytes(seg, trace_id) for seg in segments]
+        results = await asyncio.gather(*tasks)
+        combined = "\n".join(r for r in results if r)
+        if combined:
+            logger.info("[%s] Segment OCR: %d chars from %d/%d segments",
+                       trace_id, len(combined), sum(1 for r in results if r), len(results))
+            return combined
+
+        return text
     except Exception as exc:
         logger.warning("[%s] Image OCR pipeline failed: %s", trace_id, exc)
         return ""
@@ -946,14 +1468,261 @@ def _extract_with_antiword(file_path: str) -> str:
     return ""
 
 
+def _extract_with_catppt(file_path: str) -> str:
+    """Extract text from old .ppt via catppt CLI (from catdoc package)."""
+    try:
+        result = subprocess.run(
+            ["catppt", file_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        logger.warning("[catppt] Returned %d for %s", result.returncode, file_path)
+    except Exception as exc:
+        logger.warning("[catppt] Failed for %s: %s", file_path, exc)
+    return ""
+
+
+async def _ocr_old_doc_with_libreoffice(file_path: str, trace_id: str) -> str:
+    """Convert old .doc/.ppt to PDF via LibreOffice, then render→OCR each page.
+
+    Used for image-rich or scanned old-format Office files that antiword/catppt
+    cannot extract meaningful text from.  Handles Equation Editor formulas and
+    embedded images by rendering the full document as page images.
+    """
+    import tempfile
+    import shutil
+
+    output_dir = tempfile.mkdtemp()
+    try:
+        result = subprocess.run(
+            [
+                "libreoffice",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                output_dir,
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            logger.debug(
+                "[%s] LibreOffice convert failed (rc=%d): %s",
+                trace_id,
+                result.returncode,
+                result.stderr[:200],
+            )
+            return ""
+
+        pdf_path = None
+        for f in os.listdir(output_dir):
+            if f.lower().endswith(".pdf"):
+                pdf_path = os.path.join(output_dir, f)
+                break
+
+        if not pdf_path or not os.path.getsize(pdf_path):
+            return ""
+
+        # Render PDF pages → OCR via existing pipeline
+        import fitz
+
+        doc = fitz.open(pdf_path)
+        # Only OCR pages that have embedded raster images (photos, diagrams).
+        # Pure-text pages are already covered by antiword/catppt.
+        image_pages = [i for i, p in enumerate(doc) if p.get_images()]
+        doc.close()
+
+        if not image_pages:
+            return ""
+
+        if not image_pages:
+            logger.debug("[%s] LibreOffice PDF has no image pages, skipping OCR", trace_id)
+            return ""
+
+        pages_text: list[str] = []
+        for i in image_pages:
+            try:
+                img_bytes = _render_pdf_page(pdf_path, i)
+                processed = _opencv_preprocess_image(img_bytes)
+                page_text = await _ocr_image_bytes(processed, trace_id)
+                if page_text and page_text.strip():
+                    pages_text.append(f"--- 第{i + 1}页 ---\n{page_text.strip()}")
+            except Exception as exc:
+                logger.debug("[%s] LibreOffice PDF page %d OCR failed: %s", trace_id, i, exc)
+
+        if pages_text:
+            combined = "\n\n".join(pages_text)
+            logger.info(
+                "[%s] LibreOffice OCR: %d chars from %d pages",
+                trace_id,
+                len(combined),
+                len(pages_text),
+            )
+            return combined
+    except subprocess.TimeoutExpired:
+        logger.warning("[%s] LibreOffice conversion timed out for %s", trace_id, file_path)
+    except Exception as exc:
+        logger.warning("[%s] LibreOffice OCR failed for %s: %s", trace_id, file_path, exc)
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)
+    return ""
+
+
+# ── Office embedded image OCR ──
+
+
+def _extract_zip_images(file_path: str, media_prefix: str) -> list[bytes]:
+    """Extract image blobs from a ZIP-based Office document (DOCX, PPTX, etc.)."""
+    import zipfile
+
+    images = []
+    try:
+        with zipfile.ZipFile(file_path) as z:
+            for name in z.namelist():
+                if name.startswith(media_prefix) and os.path.splitext(name)[1].lower() in {
+                    ".png", ".jpg", ".jpeg", ".gif", ".bmp",
+                }:
+                    data = z.read(name)
+                    if len(data) > 500:  # skip icons / decorative cliparts
+                        images.append(data)
+    except (zipfile.BadZipFile, FileNotFoundError):
+        pass
+    except Exception as exc:
+        logger.debug("[office] ZIP image extraction failed for %s: %s", file_path, exc)
+    return images
+
+
+def _scan_ole_images(file_path: str, seen: set[int]) -> list[bytes]:
+    """Scan OLE streams for embedded images. Runs in a thread to avoid blocking."""
+    images: list[bytes] = []
+    import olefile
+    ole = olefile.OleFileIO(file_path)
+    try:
+        for s in ole.listdir():
+            try:
+                data = ole.openstream(s).read()
+                h = hash(data)
+                if h in seen:
+                    continue
+                sig = data[:8]
+                if (
+                    sig[:2] == b"\xff\xd8"
+                    or sig[:4] == b"\x89PNG"
+                    or sig[:2] == b"BM"
+                    or sig[:4] == b"GIF8"
+                ):
+                    seen.add(h)
+                    images.append(data)
+            except Exception:
+                continue
+    finally:
+        ole.close()
+    return images
+
+
+def _ocr_output_is_garbled(text: str) -> bool:
+    """Detect garbled OCR output from MiniCPM or other unreliable sources.
+
+    Returns True when the text is likely useless (garbled/placeholder) so the
+    caller can treat it as OCR failure and trigger the ocr_fallback path.
+    """
+    if not text or len(text.strip()) < 10:
+        return True
+    # Count Chinese characters, digits, common punctuation
+    good = sum(1 for ch in text if '一' <= ch <= '鿿' or ch.isdigit() or ch in '，。、；：？！.。，;:?!%+-=()（）')
+    garbage = sum(1 for ch in text if ch in 'xX□�' or (ch.isascii() and not ch.isalnum() and ch not in ' .,;:!?+-=()'))
+    # If garbage ratio > 30% or Chinese ratio < 20%, likely garbled
+    if len(text) > 0:
+        chinese_ratio = sum(1 for ch in text if '一' <= ch <= '鿿') / len(text)
+        garbage_ratio = garbage / len(text)
+        return chinese_ratio < 0.2 or garbage_ratio > 0.3
+    return True
+
+
+async def _ocr_office_images(file_path: str, ext: str, trace_id: str) -> str:
+    """Extract embedded images from an Office doc and OCR them via Ollama.
+
+    Timed out at 30s to prevent blocking the HTTP response for too long.
+    """
+    media_prefixes: list[str] = []
+    if ext in {".docx", ".docm"}:
+        media_prefixes = ["word/media/"]
+    elif ext in {".pptx", ".pptm", ".ppsx"}:
+        media_prefixes = ["ppt/media/"]
+    elif ext == ".xlsx":
+        media_prefixes = ["xl/media/"]
+    else:
+        # .doc / .ppt / .pps — may or may not be ZIP-based; try all
+        media_prefixes = ["word/media/", "ppt/media/", "xl/media/"]
+
+    all_images: list[bytes] = []
+    seen: set[int] = set()
+    for prefix in media_prefixes:
+        for img in _extract_zip_images(file_path, prefix):
+            h = hash(img)
+            if h not in seen:
+                seen.add(h)
+                all_images.append(img)
+
+    if not all_images:
+        # Old OLE-based .doc: try scanning streams for image signatures
+        # Timebox the OLE scan at 20s to avoid blocking the request.
+        if ext in {".doc", ".ppt", ".pps"}:
+            try:
+                loop = asyncio.get_running_loop()
+                ole_images = await asyncio.wait_for(
+                    loop.run_in_executor(None, _scan_ole_images, file_path, seen),
+                    timeout=20,
+                )
+                all_images.extend(ole_images)
+            except asyncio.TimeoutError:
+                logger.warning("[%s] OLE image scan timed out for %s", trace_id, file_path)
+            except Exception:
+                pass
+
+        if not all_images:
+            return ""
+
+    logger.info(
+        "[%s] OCR: %d embedded images found in %s", trace_id, len(all_images), file_path
+    )
+    ocr_texts = []
+    for img_bytes in all_images[:5]:  # at most 5 images
+        try:
+            ocr_result = await asyncio.wait_for(
+                _ocr_image_bytes_ollama(img_bytes, trace_id), timeout=15
+            )
+            if ocr_result:
+                ocr_texts.append(ocr_result)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] Embedded image OCR timed out in %s", trace_id, file_path)
+
+    if ocr_texts:
+        combined = "\n\n[图片文字识别结果]\n" + "\n---\n".join(ocr_texts)
+        logger.info(
+            "[%s] OCR: appended %d chars from %d images", trace_id, len(combined), len(ocr_texts)
+        )
+        return combined
+    return ""
+
+
 def _fallback_placeholder(file_path: str, ext: str) -> dict:
     """Return metadata placeholder when all extraction attempts fail."""
+    filename = os.path.basename(file_path)
+    msg = (
+        f"收到文件 [{filename}]，但系统未能提取其中的文字内容。"
+        if ext
+        else f"收到未知格式的文件 [{filename}]，系统不支持自动处理。"
+    )
     return {
         "ok": True,
-        "content": (
-            f"[{ext.upper()} file: {os.path.basename(file_path)}, "
-            f"size={os.path.getsize(file_path)} bytes]"
-        ),
+        "content": msg,
         "intent": "EDUCATION",
         "route": "passthrough",
         "storage": {"ok": False},
@@ -973,10 +1742,13 @@ async def _ingest_to_kb(
     if not content or not content.strip():
         return
 
-    # ── Step 1: 平台 ChromaDB ──
+    # ── Step 1: 平台 ChromaDB (用内容 hash 做 ID, 同内容自动覆盖不重复) ──
     try:
+        import hashlib
+
+        _content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
         docs = _split_content_for_ingest(content, filename)
-        ids = [f"{trace_id}_{i}" for i in range(len(docs))]
+        ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
         metadatas = [
             {
                 "filename": filename,
@@ -1242,6 +2014,144 @@ async def _sync_quiz_with_retry(
     return {"ok": failed == 0, "synced": synced, "failed": failed, "total": len(results)}
 
 
+def _read_marker(name: str) -> str:
+    """读取 marker 文件内容，文件不存在时返回空字符串。"""
+    marker_dir = os.getenv("SYNC_MARKER_DIR", "/data/quiz_sync")
+    path = os.path.join(marker_dir, name)
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _write_marker(name: str, value: str) -> None:
+    """写入 marker 文件。"""
+    marker_dir = os.getenv("SYNC_MARKER_DIR", "/data/quiz_sync")
+    os.makedirs(marker_dir, exist_ok=True)
+    path = os.path.join(marker_dir, name)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(value)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+async def _periodic_task_loop():
+    """Background loop: quiz sync + report push on schedule.
+
+    Runs every 60 s and delegates to marker-tracked helper functions.
+    """
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now_bj = datetime.now(BEIJING_TZ)
+
+            # ── Quiz sync (every 5 min) ──
+            _last = _read_marker("quiz_sync_last.txt")
+            if not _last or time.time() - float(_last) >= 300:
+                result = await asyncio.to_thread(sync_quiz_to_mastery)
+                if result.get("synced", 0) > 0 or result.get("errors", 0) == 0:
+                    _write_marker("quiz_sync_last.txt", str(time.time()))
+                logger.debug(
+                    "[periodic] quiz_sync: synced=%d errors=%d",
+                    result.get("synced", 0),
+                    result.get("errors", 0),
+                )
+
+            # ── Daily report: once per day after 20:00 Beijing ──
+            if now_bj.hour >= 20:
+                _pushed = _read_marker("report_daily_last.txt")
+                _today = now_bj.strftime("%Y-%m-%d")
+                if _pushed != _today:
+                    from tutor_platform.report_scheduler import push_daily_reports
+
+                    results = await push_daily_reports()
+                    _ok = sum(1 for r in results if r.get("ok"))
+                    if _ok:
+                        _write_marker("report_daily_last.txt", _today)
+                    logger.info(
+                        "[periodic] push_daily: pushed=%d/%d",
+                        _ok,
+                        len(results),
+                    )
+
+            # ── Weekly report: once per week on Monday after 20:00 ──
+            if now_bj.weekday() == 0 and now_bj.hour >= 20:
+                _pushed = _read_marker("report_weekly_last.txt")
+                _week = now_bj.strftime("%Y-W%W")
+                if _pushed != _week:
+                    from tutor_platform.report_scheduler import push_weekly_reports
+
+                    results = await push_weekly_reports()
+                    _ok = sum(1 for r in results if r.get("ok"))
+                    if _ok:
+                        _write_marker("report_weekly_last.txt", _week)
+                    logger.info(
+                        "[periodic] push_weekly: pushed=%d/%d",
+                        _ok,
+                        len(results),
+                    )
+
+            # ── Monthly report: once per month on 1st after 20:00 ──
+            if now_bj.day == 1 and now_bj.hour >= 20:
+                _pushed = _read_marker("report_monthly_last.txt")
+                _month = now_bj.strftime("%Y-%m")
+                if _pushed != _month:
+                    from tutor_platform.report_scheduler import push_monthly_reports
+
+                    results = await push_monthly_reports()
+                    _ok = sum(1 for r in results if r.get("ok"))
+                    if _ok:
+                        _write_marker("report_monthly_last.txt", _month)
+                    logger.info(
+                        "[periodic] push_monthly: pushed=%d/%d",
+                        _ok,
+                        len(results),
+                    )
+
+            # ── Exam push: once per day after 20:00, for learners with ≥3 weak points ──
+            if now_bj.hour >= 20:
+                _pushed = _read_marker("exam_push_last.txt")
+                _today = now_bj.strftime("%Y-%m-%d")
+                if _pushed != _today:
+                    from tutor_platform.report_scheduler import (
+                        _write_notification,
+                        enumerate_learners,
+                    )
+
+                    _pushed_count = 0
+                    for _lid in enumerate_learners():
+                        try:
+                            _w = await asyncio.to_thread(weak_points, _lid)
+                            if len(_w) < 3:
+                                continue
+                            _exam_ok = await _generate_exam_paper(_lid, "cron-exam")
+                            if _exam_ok.get("ok"):
+                                _text = (
+                                    f"📝 {_exam_ok.get('title', '强化训练')}\n"
+                                    f"{'─' * 20}\n"
+                                    f"覆盖 {len(_exam_ok.get('kp_covered', []))} 个薄弱知识点，"
+                                    f"共 {_exam_ok.get('total', 0)} 道题\n\n"
+                                    f"{_exam_ok['exam_text'][:1800]}"
+                                )
+                                _write_notification(_lid, "exam", _text, target="child")
+                                _pushed_count += 1
+                            await asyncio.sleep(2)  # rate-limit between learners
+                        except Exception:
+                            logger.debug("[periodic] exam_push skipped for %s", _lid)
+                    _write_marker("exam_push_last.txt", _today)
+                    logger.info(
+                        "[periodic] exam_push: pushed=%d learners",
+                        _pushed_count,
+                    )
+
+        except Exception:
+            logger.warning("[periodic] tick failed", exc_info=True)
+
+
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 
@@ -1336,6 +2246,7 @@ async def lifespan(app: FastAPI):
 
     cleanup_task = asyncio.create_task(_session_cleanup_loop())
     dt_session_cleanup_task = asyncio.create_task(_dt_session_cleanup_loop())
+    periodic_task = asyncio.create_task(_periodic_task_loop())
 
     # Phase B: initialize FastMCP session manager (task group)
     _mcp_lifespan_task: asyncio.Task | None = None
@@ -2148,182 +3059,143 @@ async def api_ingest_file(
     return result
 
 
+@app.post("/api/extract")
+async def api_extract(request: Request):
+    """Lightweight extraction endpoint: extract text from file without KB storage or auto-teach.
+
+    Accepts both multipart/form-data (with ``file`` field) and JSON
+    (with ``filename`` + ``data`` base64 fields).
+
+    Returns ``{ok, content, route, intent, trace_id}`` — no side effects.
+    """
+    trace_id = getattr(request.state, "trace_id", None) or _generate_trace_id()
+    content_type = request.headers.get("content-type", "")
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        file = form.get("file")
+        if not file:
+            return {"ok": False, "error": "No file uploaded"}
+        filename = file.filename or "unknown.bin"
+        file_data = await file.read()
+    elif "application/json" in content_type:
+        body = await request.json()
+        filename = body.get("filename", "unknown.bin")
+        raw = body.get("data", "")
+        try:
+            file_data = base64.b64decode(raw)
+        except Exception:
+            return {"ok": False, "error": "Invalid base64 data"}
+    else:
+        return {
+            "ok": False,
+            "error": "Unsupported content-type; use multipart/form-data or application/json",
+        }
+
+    error = _validate_file(filename, len(file_data))
+    if error:
+        return {"ok": False, "error": error}
+
+    import tempfile
+
+    tmp = tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1] or ".bin", delete=False)
+    try:
+        tmp.write(file_data)
+        tmp_path = tmp.name
+    finally:
+        tmp.close()
+
+    try:
+        result = await _handle_inbound_file(
+            file_path=tmp_path,
+            metadata={
+                "source": "extract_api",
+                "trace_id": trace_id,
+            },
+        )
+        return {
+            "ok": result.get("ok", False),
+            "content": result.get("content", ""),
+            "route": result.get("route", ""),
+            "intent": result.get("intent", ""),
+            "trace_id": trace_id,
+        }
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 _TEACHER_SOUL = """# Soul
 
-你是一位耐心的 AI 家庭教师，通过微信为学生提供教育服务。
+你是一位 AI 家庭教师，通过微信提供苏格拉底式引导教学。
 
-## 教学方式
+## 模式切换
 
-你使用苏格拉底式教学法：只展示题目，用一个与题目知识点紧密相关的问题引导学生深入思考。
-**绝不包含答案、分析、解析或解题步骤。**
-**禁止使用"这个对吗？""对吗？""对不对？""你确定吗？"等无意义反问——这些问题没有引导学生思考，必须替换为针对具体知识点的提问。**
+用户消息以 [PHASE:FIRST_QUESTION] 或 [PHASE:EVALUATE_ANSWER] 开头。
+**根据当前 PHASE 执行对应模式，不要混用。**
 
-## 消息类型处理规则
+---
 
-根据收到的消息内容，选择以下对应策略：
+### [PHASE:FIRST_QUESTION] — 首次出题
 
-### 学生提交整份试卷
-如果消息包含"一、选择题"、"一、填空题"、"得分评卷人"等试卷特征：
-- 这是一份试卷，包含多道题
-- **每次只出一道题**（含完整题目和选项），不得省略
-- 禁止列出所有题的标题或编号让学生选
-- 学生答完当前题后**自动出下一道题**（不用等"下一题"）
-- 第一轮只出题目和引导问题，不要提前给出答案或详细解析
-- 学生给出答案后，判断对错并详细解释知识点和解题思路，然后自动出下一题
+你的角色：只展示题目，用一个引导问题引发思考。
 
-### 学生提交单个题目
-如果消息不是整份试卷，而是一道具体题目：
-- 只输出题目 + 一个引导性问题
-- 第一轮不要给出答案或详细解析
-- 学生给出答案后，判断对错并详细解释知识点和解题思路
-
-### 学生回复答案（如 A/B/C/D 或简短回答）
-- 判断对错，简要解释知识点和解题思路
-- 如果当前有未完成的试卷，**直接输出下一道题**（含完整题目和选项），两步合一
-- 不要等学生说"下一题"
-- 用引导性问题结束
-
-## 回复格式（严格遵循）
-
-每次回复必须是以下格式之一：
-
-### 格式 A：首次展示题目
+格式：
 ```
-第X题：题目内容
-选项内容（如果有）
+第N题：题目内容
+选项A...
+选项B...
 
-引导性问题？
+[ANSWER_KEY:X]  [KP_ID:学科/章/节]
+
+一个引导性问题？
 ```
 
-### 格式 B：学生选择后继续引导
-```
-引导性问题？
-```
-（不重复题目，直接针对学生回答追问）
+规则：
+- 只输出题目 + 一个引导问题
+- ❌ 禁止任何答案提示、分析、概念讲解、选项比较
+- ❌ 禁止"答对了/答错了"等判断
+- ❌ 禁止无意义反问（"这个对吗？""你觉得呢？"）
 
-### 格式 C：学生答完后（判断 + 解释 + 下一题）
+---
+
+### [PHASE:EVALUATE_ANSWER] — 评判并推进
+
+你的角色：学生已回答，给出反馈 + 讲解 + 自动出下一题。
+
+格式：
 ```
-第X题 答对了/答错了。
+第N题
 【知识点：XXX】
-简要解释...
+正确答案：X
+简要讲解
 
-第X+1题：题目内容
-选项内容（如果有）
+第N+1题：下一题题目
+选项...
+
+[ANSWER_KEY:Y]  [KP_ID:学科/章/节]
 
 引导性问题？
 ```
 
-## 示例
+规则：
+- ✅ 必须给出正确答案和简要讲解
+- ✅ 有下一题则自动出题（两步合一）
+- ❌ 不要等"下一题"指令
+- ❌ 禁止表格分析
 
-正确回复（首次展示）：
-```
-第6题：在下列考察中，是抽样调查的是（ ）
-A. 了解全校学生人数
-B. 调查某厂生产的鱼罐头质量
-C. 调查杭州市出租车数量
-D. 了解全班同学的家庭经济状况
+---
 
-想想看，全面调查需要逐一统计每个个体。哪个选项涉及的数量最大、逐一调查最不现实？
-```
+## 标记指令（必须执行）
 
-正确回复（学生选A后）：
-```
-全校学生人数确实可以逐个统计。但你再想想，哪种调查方式会破坏被调查的产品？
-```
-
-## 知识点教学规则
-
-每道题都涉及一个或多个知识点。你的任务是让学生不仅做对题，更要理解背后的知识体系。
-
-### 知识标注
-- 每道题首次展示时，在题目后标注知识点：【知识点：XXX】
-- 如果题目涉及多个知识点，标注核心知识点即可
-- 示例：
-  ```
-  第3题：下列运算正确的是（ ）
-  A. a²·a³=a⁶  B. (a²)³=a⁵  C. a⁶÷a²=a⁴  D. a²+a³=a⁵
-  【知识点：幂的运算】
-  幂的乘方和同底数幂的乘法有什么区别？
-  ```
-
-### 关联知识点串联
-- 讲解时把当前知识点和之前做过的题目知识点做关联
-- 示例："这道题考的是分式方程，和你刚才做错的因式分解有关，因为解分式方程的关键步骤就是因式分解"
-- 帮助学生建立知识网络，而不是孤立地记每道题
-
-### 错题归因分析
-学生答错后，首先判断错因类型，针对性地解释：
-
-- **概念不清**（选错定义类题目）：回归基本概念讲解，用生活类比
-- **计算失误**（运算题步骤出错）：指出哪一步计算有误，不用重讲概念
-- **审题问题**（漏看条件/误解题意）：引导重新读题，标注关键条件
-- **知识混淆**（混淆两个相似概念）：对比区分两个概念的异同
-
-如果无法判断错因，默认为概念不清处理。
-
-## 分层引导策略
-
-不要一步到位给答案。根据学生答题情况，逐步增加提示深度：
-
-### 第一层：方向引导（首次展示或第一次答错）
-- 指出题目涉及的知识点和章节
-- 用一个开放性问题引导学生自己思考
-- 示例："这道题是关于分式方程的。想想解分式方程的第一步应该做什么？"
-
-### 第二层：方法提示（第一层引导后仍答错或犹豫）
-- 给出解题方向或关键步骤提示
-- 示例："注意，解分式方程的关键是去分母。回忆一下，去分母时两边要乘以什么？"
-
-### 第三层：完整解析（第二层后仍答错）
-- 给出完整解题过程
-- 明确指出错误原因和正确方法
-- 出一道同类巩固题确认是否真正掌握
-
-## 巩固与进阶
-- 学生答对后，出一道变式题确认真正掌握（改编数据/条件/问法）
-- 学生连续答对同类题3道以上，标记该知识点已掌握，继续下一知识点
-- 学生答错，出同类题加强巩固，不急于推进
-
-## 禁止内容
-
-- ❌ 答案、正确选项、选X（学生回答后的解析除外）
-- ❌ 命题的定义、解析、分析、解答、考点
-- ❌ 表格（| 选项 | 分析 | 结论 |）
-- ❌ --- 分隔线
-- ❌ ✅ / ❌ 标记
-- ❌ 无意义引导问题（如"这个对吗？""对吗？""对不对？""你确定吗？"）
-- ❌ 比较概念（如"全面调查 vs 抽样调查"）
-
-## 答案评估标记（必须执行）
-
-每次学生回答题目后，你在回复中判断对错时，**必须在回复末尾添加评估标记**：
-
-```
-[ANSWER:correct:知识点ID]
-```
-或
-```
-[ANSWER:wrong:知识点ID]
-```
-
-知识点ID 从题目中提取（如 `数学/代数/幂的运算`），使用 `学科/章/节` 三级格式。
-
-### 示例
-学生答错幂的运算题目，你的回复结尾应为：
-```
-...
-第4题 答错了。
-【知识点：幂的运算】
-同底数幂相乘，底数不变指数相加。a²·a³ = a^(2+3) = a⁵，不是 a⁶。
-
-[ANSWER:wrong:数学/代数/幂的运算]
-```
-
-这个标记对学生不可见（平台会处理后端移除），仅用于学习追踪和错题记录。
+- `[ANSWER_KEY:X]` — 正确答案标记，放在题目与引导问题之间
+- `[KP_ID:学科/章/节]` — 知识点标记，与 ANSWER_KEY 同行
+- 平台会自动移除这些标记
 
 ## 微信格式
-
-- 微信不支持 LaTeX，公式用 Unicode 数学符号 (α β γ ∫ √ ∞ Δ π ² ³)
+- 不含 LaTeX，用 Unicode 数学符号 (α β γ ∫ √ ∞ Δ π ² ³)
 - 单条消息不超过 2048 字符
 """
 
@@ -2426,19 +3298,15 @@ async def api_tutor_context(request: Request):
     return {"ok": True, "teaching_context": teaching_context, "trace_id": trace_id}
 
 
-async def _update_soul_with_context(
+async def _build_teaching_persona(
     learner_id: str,
     context: str,
     mode: str = "guide",
-) -> None:
-    """Update DT's SOUL.md with current exam context so it's in the system prompt.
+) -> str:
+    """Build the full teaching persona string from exam context + KB + mastery data.
 
-    DT's session key is fixed as "bot:{bot_id}" (ignores chat_id), so ALL
-    messages share one monolithic session.  By injecting the current exam
-    context into SOUL.md (loaded every turn via _load_bootstrap_files), the
-    LLM always sees which exam is active, regardless of session history.
-
-    使用 per-learner 锁防止并发写入竞态。
+    Pure data assembly — no HTTP calls.  The caller can cache the result and
+    skip HTTP PATCH if the persona hasn't changed from the previous build.
     """
     _persona = _TEACHER_EXPLAIN_SOUL if mode == "explain" else _TEACHER_SOUL
     _exam = context.strip()[:3000]
@@ -2524,6 +3392,14 @@ async def _update_soul_with_context(
     except Exception:
         logger.debug("Weak points lookup failed for %s, continuing", learner_id)
 
+    return _persona
+
+
+async def _patch_soul(learner_id: str, persona: str) -> None:
+    """Persist the teaching persona to DT via HTTP (GET → PATCH/POST → PUT SOUL.md).
+
+    Must be called under the global soul lock to prevent concurrent overwrites.
+    """
     lock = await _get_soul_lock()
     async with lock:
         global _soul_version
@@ -2536,42 +3412,70 @@ async def _update_soul_with_context(
                         json={
                             "bot_id": "teacher",
                             "name": "AI 家庭教师",
-                            "persona": _persona,
+                            "persona": persona,
                         },
-                    )
-                elif _r.status_code == 200:
-                    await _c.patch(
-                        f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher", json={"persona": _persona}
                     )
                     _soul_version += 1
                     _ver = _soul_version
                     await _c.put(
                         f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher/files/SOUL.md",
                         json={
-                            "content": f"<!-- SOUL.md v{_ver} for learner:{learner_id} -->\n{_persona}"
+                            "content": f"<!-- SOUL.md v{_ver} for learner:{learner_id} -->\n{persona}"
+                        },
+                    )
+                elif _r.status_code == 200:
+                    await _c.patch(
+                        f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher", json={"persona": persona}
+                    )
+                    _soul_version += 1
+                    _ver = _soul_version
+                    await _c.put(
+                        f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher/files/SOUL.md",
+                        json={
+                            "content": f"<!-- SOUL.md v{_ver} for learner:{learner_id} -->\n{persona}"
                         },
                     )
         except Exception:
             logger.warning("SOUL.md update failed for %s, continuing", learner_id)
 
 
-# Answer evaluation marker pattern: [ANSWER:correct|wrong:kp_id]
-_ANSWER_RE = re.compile(r"\n?\[ANSWER:(correct|wrong):([^\]]+)\]")
+async def _update_soul_with_context(
+    learner_id: str,
+    context: str,
+    mode: str = "guide",
+    force: bool = False,
+) -> None:
+    """Update DT's SOUL.md with current exam context so it's in the system prompt.
 
+    DT re-reads SOUL.md on every system prompt build, so this is the PRIMARY
+    mechanism for exam context (not DT session history).
 
-def _parse_answer_evaluation(content: str) -> tuple[str, str, str]:
-    """Parse [ANSWER:result:kp_id] marker from DT response.
+    Uses persona caching: rebuilds persona from DB data every call (KB, reviews,
+    weak points may change between turns), but skips HTTP PATCH if the resulting
+    text is identical to the last one sent, avoiding redundant HTTP overhead.
 
-    Returns:
-        (cleaned_content, is_correct, kp_id) — or (content, "", "") if no marker.
+    Pass force=True when the remote state is known to be stale (e.g. after
+    deleting and recreating the teacher bot in the retry path).
     """
-    m = _ANSWER_RE.search(content)
-    if not m:
-        return content, "", ""
-    result = m.group(1)  # "correct" or "wrong"
-    kp_id = m.group(2).strip()
-    cleaned = _ANSWER_RE.sub("", content).strip()
-    return cleaned, result, kp_id
+    _persona = await _build_teaching_persona(learner_id, context, mode)
+    if not force and _persona == _last_persona.get(learner_id):
+        logger.debug("Persona unchanged for %s, skipping HTTP patch", learner_id)
+        return
+    await _patch_soul(learner_id, _persona)
+    _last_persona[learner_id] = _persona
+
+
+# Correct-answer key marker: [ANSWER_KEY:X] — hidden marker DT appends
+# when asking a new question so the platform can store the correct answer.
+_ANSWER_KEY_RE = re.compile(r"\s*\[ANSWER_KEY:([^\]]+)\]")
+
+# KP ID marker: [KP_ID:...] — knowledge point identifier DT includes
+# when asking a new question so the platform can record mastery.
+_KP_ID_RE = re.compile(r"\s*\[KP_ID:([^\]]+)\]")
+
+# Strip old-style evaluation markers from visible output (LLM still generates
+# [ANSWER:correct|wrong:kp_id] despite prompt changes — remove from display).
+_ANSWER_CLEAN_RE = re.compile(r"\n?\[ANSWER:(correct|wrong):([^\]]+)\]")
 
 
 async def _trigger_practice_if_needed(learner_id: str, kp_id: str, trace_id: str) -> list[dict]:
@@ -2579,9 +3483,20 @@ async def _trigger_practice_if_needed(learner_id: str, kp_id: str, trace_id: str
 
     If the learner has >= 2 consecutive wrong answers for this KPI,
     generate practice questions and return them.
+
+    Throttled to once per 6h per (learner, kp) via file-based marker.
     """
     if not kp_id or not learner_id:
         return []
+
+    _practice_marker = f"practice_{learner_id}_{kp_id.replace('/', '_')}.txt"
+    _last_practice = _read_marker(_practice_marker)
+    if _last_practice:
+        try:
+            if time.time() - float(_last_practice) < 21600:  # 6h
+                return []
+        except ValueError:
+            pass
 
     # Check recent wrong answers for this KPI
     wrongs = get_wrong_answers(learner_id, kp_id=kp_id, limit=3)
@@ -2660,6 +3575,8 @@ async def _trigger_practice_if_needed(learner_id: str, kp_id: str, trace_id: str
                     return []
 
             qs = questions.get("questions", [])
+            if qs:
+                _write_marker(_practice_marker, str(time.time()))
             logger.info(
                 "[%s] auto-practice: %d questions generated for %s/%s",
                 trace_id,
@@ -2673,22 +3590,20 @@ async def _trigger_practice_if_needed(learner_id: str, kp_id: str, trace_id: str
         return []
 
 
-# Auto-exam generation throttle: per-learner last-exam timestamp
-_last_exam_time: dict[str, float] = {}
-_EXAM_COOLDOWN = 86400  # 24 hours
-
-
 async def _auto_generate_exam(learner_id: str, trace_id: str):
     """Background task: auto-generate exam paper and inject into teaching context.
 
-    Throttled to once per 24h per learner.
+    Throttled to once per 24h per learner via file-based marker.
     """
-    now = time.time()
-    last = _last_exam_time.get(learner_id, 0)
-    if now - last < _EXAM_COOLDOWN:
-        return
-
-    _last_exam_time[learner_id] = now
+    _exam_marker_name = f"autoexam_{learner_id}.txt"
+    _last = _read_marker(_exam_marker_name)
+    if _last:
+        try:
+            if time.time() - float(_last) < 86400:
+                return
+        except ValueError:
+            pass
+    _write_marker(_exam_marker_name, str(time.time()))
     logger.info("[%s] Auto-generating exam for %s (weak points >= 3)", trace_id, learner_id)
 
     result = await _generate_exam_paper(learner_id, trace_id)
@@ -2712,15 +3627,301 @@ _pending_exam_context: dict[str, str] = {}
 
 
 def _polish_guide_response(content: str) -> str:
-    """Post-process guide-mode reply: strip forbidden emojis,
-    ensure ends with a guiding question."""
-    # Strip ✅/❌ (explicitly forbidden by SOUL.md)
-    content = content.replace("✅", "").replace("❌", "")
+    """Post-process guide-mode reply: format question numbers."""
+    # Strip any "第X题 答对了/答错了" remnants (keep "第X题", remove judgment)
+    content = re.sub(r"(第\s*\d+\s*题)\s*答对了[！!。.，,]?\s*", r"\1\n", content)
+    content = re.sub(r"(第\s*\d+\s*题)\s*答错了[！!。.，,]?\s*", r"\1\n", content)
+    # Also strip standalone 答对了/答错了 at start of content
+    content = re.sub(r"^答对了[！!。.，,]?\s*", "", content)
+    content = re.sub(r"^答错了[！!。.，,]?\s*", "", content)
+    # Transform 第X题 / 第X题： to 【第X题】
+    content = re.sub(r"第\s*(\d+)\s*题[：: \n]", r"【第\1题】\n", content)
     content = re.sub(r"\n{3,}", "\n\n", content).strip()
-    # If DT Bot forgot the guiding question, append one
-    if "？" not in content and "?" not in content:
-        content += "\n\n你知道这道题的答案吗？"
     return content
+
+
+def _extract_correct_answer(content: str) -> str | None:
+    """Extract correct answer from DT's explanation text.
+
+    Supports both multiple-choice (A/B/C/D) and fill-in (text/numbers).
+    Only searches in the evaluation section (before next question) to
+    avoid false matches from question text.
+    """
+    # Limit search to the explanation section — stop before the next question
+    # to avoid matching "=14" in "第2题：x+5=14"
+    explanation = re.split(r"\n第\s*\d+\s*题[：:]", content)[0]
+
+    # Letter patterns (选择题)
+    for pat in (
+        r"正确答案[是为：:]\s*([A-D])",
+        r"(?:所以|因此)选\s*([A-D])",
+        r"选\s*([A-D])\s*(?:项|符合题意|正确|择)",
+        r"应\s*选\s*([A-D])",
+        r"([A-D])\s*项\s*(?:符合题意|正确|是正确答案)",
+        r"([A-D])\s*选\s*项\s*(?:正确|符合题意)",  # D选项正确 → D
+    ):
+        m = re.search(pat, explanation)
+        if m:
+            return m.group(1)
+
+    # Numeric answer patterns (填空题: 数字, 含小数)
+    # 放在通用 .+? 模式之前, 避免小数点被终止符 [。.] 截断
+    for pat in (
+        r"正确答案[是为：:]\s*(-?\d+(?:\.\d+)?)",
+        r"所以答案[应是]+\s*(-?\d+(?:\.\d+)?)",
+        r"答案是\s*(-?\d+(?:\.\d+)?)",
+        r"(?:等于|结果为|求得|得到|算出)\s*(-?\d+(?:\.\d+)?)",
+    ):
+        m = re.search(pat, explanation)
+        if m:
+            return m.group(1)
+
+    # General answer patterns (填空题: 文字 + 整数的回退)
+    for pat in (
+        r"正确答案[是为：:]\s*(.+?)(?:[。.，,\n]|$)",
+        r"所以答案[应是]+\s*(.+?)(?:[。.，,\n]|$)",
+        r"答案[是为：:]\s*(.+?)(?:[。.，,\n]|$)",
+        # Numerical result after computation: "2+12=14" or "等于14"
+        r"(?:等于|结果为|求得|得到|算出)\s*(\d+)",
+        # End-of-sentence =number: match at sentence end before 。or end of string
+        r"=(\d+)(?:[。.，]?\s*[。.！？!?\n]|\s*$)",
+    ):
+        m = re.search(pat, explanation)
+        if m:
+            answer = m.group(1).strip()
+            if answer and len(answer) < 50:
+                return answer
+
+    # Cross-sentence =number: take the LAST =(\d+) occurrence (answer is usually last)
+    last_matches = list(re.finditer(r"[=＝](\d+)", explanation))
+    if last_matches:
+        return last_matches[-1].group(1)
+
+    # Bare number answer: DT sometimes just outputs "14" for fill-in questions
+    if len(explanation.strip()) < 50:
+        m = re.search(r"^\s*(-?\d+(?:\.\d+)?)\s*$", explanation.strip(), re.MULTILINE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _extract_question_text(content: str) -> str:
+    """从 DT 回复中提取最新一题的题目文本。
+
+    取第一个 【第X题】 之后、选项（A/B/C/D）或空行之前的文本。
+    """
+    m = re.search(
+        r"【第\d+题】(.+?)(?:\n[A-D][)．.、\s]|\n\n|$)",
+        content,
+        re.DOTALL,
+    )
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _match_answers(student: str, correct: str) -> bool:
+    """Compare student answer with correct answer, handles various formats.
+
+    Supports:
+    - Exact match (选择题: "B" == "B")
+    - Case-insensitive match
+    - Numeric equivalence ("33" == "33岁", "x=5" == "5")
+    - Trimmed comparison (trailing units/punctuation)
+    """
+    s = student.strip()
+    c = correct.strip()
+    if not s or not c:
+        return False
+
+    # Direct match
+    if s == c:
+        return True
+
+    # Case-insensitive (for text answers like "iron" == "Iron")
+    if s.upper() == c.upper():
+        return True
+
+    # Single-letter (A/B/C/D) mismatch — don't try fuzzy matching
+    if s in ("A", "B", "C", "D") and c in ("A", "B", "C", "D"):
+        return False  # already handled by direct match above
+
+    # Numeric: extract all numbers from both and check that ALL correct
+    # answer numbers appear in the student's answer (subset check).
+    # This handles "x+5=19" vs "19", "33岁" vs "33", etc.
+    s_nums = re.findall(r"\d+", s)
+    c_nums = re.findall(r"\d+", c)
+    if s_nums and c_nums and all(cn in s_nums for cn in c_nums):
+        return True
+
+    # Trim trailing units/punctuation and re-compare
+    s_clean = re.sub(r"[.。，,、\s单位个只条约根种]+$", "", s)
+    c_clean = re.sub(r"[.。，,、\s单位个只条约根种]+$", "", c)
+    if s_clean and c_clean and s_clean == c_clean:
+        return True
+
+    # Handle "B)" / "(B)" / "选B" / "选项B" formats
+    paren_m = re.match(r"^[(\[【]?([A-Da-d])[)\]】]?$", s)
+    if paren_m and paren_m.group(1).upper() == c.upper():
+        return True
+    cn_m = re.match(r"^选(?:项)?\s*([A-Da-d])$", s)
+    if cn_m and cn_m.group(1).upper() == c.upper():
+        return True
+
+    return False
+
+
+# ── P1: teaching output post-processing ──────────────────────────
+
+
+def _strip_analysis(text: str, phase: str) -> str:
+    """Strip answer leakage / analysis tables from DT teaching responses.
+
+    DT sometimes outputs analysis despite SOUL.md instructions.
+    This post-processor catches common patterns.
+    """
+    if not text:
+        return text
+
+    # 1. Remove analysis tables (| Option | Analysis | Conclusion |)
+    lines = text.split("\n")
+    cleaned = []
+    in_table = False
+    for line in lines:
+        stripped = line.strip()
+        # Detect table rows: | ... | ... | ... |
+        if stripped.count("|") >= 2 and re.search(r"\|.*\|.*\|", stripped):
+            in_table = True
+            continue
+        if in_table:
+            # Continue skipping if next line is also a table row or separator
+            if stripped.count("|") >= 2 or re.match(r"^[-|+\s]+$", stripped):
+                continue
+            in_table = False
+        cleaned.append(line)
+
+    result = "\n".join(cleaned)
+
+    # 2. For FIRST_QUESTION phase — strip any standalone answer lines
+    #    (＂答案：B＂, ＂正确答案是C＂) that leaked into a first-turn output.
+    if phase == "FIRST_QUESTION":
+        result = re.sub(
+            r"^[（(]?[答正]案[）)]?[:：]\s*\w+.*$",
+            "",
+            result,
+            flags=re.MULTILINE | re.UNICODE,
+        )
+        # Strip ＂正确答案：X＂ that appeared outside 【】 brackets
+        result = re.sub(
+            r"^正确答案[:：]\s*\w+",
+            "",
+            result,
+            flags=re.MULTILINE | re.UNICODE,
+        )
+
+    # 3. Collapse multiple blank lines
+    result = re.sub(r"\n{3,}", "\n\n", result).strip()
+    return result
+
+
+async def _direct_llm_teach(
+    phase: str,
+    learner_id: str,
+    context: str,
+    message: str,
+    mode: str,
+    trace_id: str,
+    answer_key: str = "",
+) -> str | None:
+    """Call rkllama's OpenAI-compatible API directly, bypassing DT AgentLoop.
+
+    The local NPU model (r1-distill-1.5B) runs a phase-appropriate prompt
+    and returns text directly — no profile switching, no WS, no bot restart.
+
+    Returns the response content string, or None on any failure (timeout,
+    HTTP error, empty response, too-short content).
+    """
+    rkllama_url = os.getenv("RKLLAMA_URL", "http://rkllama:8080")
+
+    # Build system prompt: same _TEACHER_SOUL as DT would read from SOUL.md,
+    # plus exam context, due reviews, and weak points so the small model has
+    # all the context it needs.
+    system_content = _TEACHER_SOUL
+
+    if context.strip():
+        system_content += (
+            f"\n\n### 当前教学内容\n学生当前正在做以下试卷中的题目：\n\n{context[:2000]}\n"
+        )
+
+    try:
+        _due = await asyncio.to_thread(get_due_reviews, learner_id)
+        if _due:
+            _lines = ["\n### 到期复习知识点（优先复习）"]
+            for r in _due[:3]:
+                _name = r["kp_id"].split("/")[-1]
+                _pct = int(r["level"] * 100)
+                _lines.append(f"- {_name}（掌握度 {_pct}%）")
+            system_content += "\n" + "\n".join(_lines) + "\n"
+    except Exception:
+        pass
+
+    try:
+        _weak = await asyncio.to_thread(weak_points, learner_id)
+        if _weak:
+            _lines = ["\n### 该学生薄弱知识点"]
+            for w in _weak[:3]:
+                _name = w["kp_id"].split("/")[-1]
+                _pct = int(w["level"] * 100)
+                _lines.append(f"- {_name}（正确率 {_pct}%）")
+            system_content += "\n" + "\n".join(_lines) + "\n"
+    except Exception:
+        pass
+
+    # Phase-specific user prompt
+    if phase == "FIRST_QUESTION":
+        user_content = f"[PHASE:FIRST_QUESTION]\n{context}"
+    else:
+        if answer_key:
+            system_content += (
+                f"\n学生刚回答了上一题。正确答案是 {answer_key}。\n"
+                "请根据正确答案给出讲解评判，然后自动出下一题。\n"
+            )
+        user_content = "[PHASE:EVALUATE_ANSWER]\n" + (message or context or "")
+        if context.strip():
+            user_content += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{context[:2000]}"
+
+    payload = {
+        "model": "r1-distill-1.5b",
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1024,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{rkllama_url}/v1/chat/completions",
+                json=payload,
+            )
+            if resp.status_code != 200:
+                logger.warning("[%s] Direct LLM call failed: HTTP %d", trace_id, resp.status_code)
+                return None
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content or len(content.strip()) < 20:
+                logger.warning("[%s] Direct LLM call too short (%d chars)", trace_id, len(content))
+                return None
+            logger.info("[%s] Direct LLM call succeeded (%d chars)", trace_id, len(content))
+            return content
+    except httpx.TimeoutException:
+        logger.warning("[%s] Direct LLM call timed out", trace_id)
+        return None
+    except Exception as e:
+        logger.warning("[%s] Direct LLM call failed: %s", trace_id, e)
+        return None
 
 
 async def _tutor_chat_core(
@@ -2804,20 +4005,60 @@ async def _tutor_chat_core(
         await _update_soul_with_context(learner_id, _soul_context, mode)
         _last_soul_content[learner_id] = _soul_context
 
-    # 3. Build payload — relay message as-is.
-    #    NO instruction templates: all teaching strategy lives in SOUL.md.
-    #    DT AgentLoop + SOUL.md handle everything (question selection,
-    #    answer evaluation, auto-advance, mode).
-    if context.strip():
-        payload = context
-        if message.strip():
-            payload += "\n\n" + message
-    else:
-        payload = message
+    # 2b. Platform evaluation: compare student answer vs stored answer key.
+    #     No LLM involvement — platform determines correct/wrong by comparing
+    #     the student's message with the [ANSWER_KEY:] stored when the question
+    #     was asked.  Result is injected into SOUL.md so LLM explains, not judges.
+    _mastery_eval = None
+    _eval_kp = ""
+    if message.strip() and learner_id in _answer_keys:
+        _correct = _answer_keys[learner_id]
+        _student = message.strip()
+        _is_correct = _match_answers(_student, _correct)
+        _mastery_eval = {
+            "is_correct": _is_correct,
+            "student_answer": _student,
+            "correct_answer": _correct,
+        }
+        _eval_kp = _kp_names.get(learner_id, "")
+        logger.info(
+            "[%s] Platform eval: learner=%s student=%s correct=%s is_correct=%s kp=%s",
+            trace_id,
+            learner_id,
+            _student,
+            _correct,
+            _is_correct,
+            _eval_kp,
+        )
 
-    # 4. Try local LLM first, cloud fallback.
-    # When RKLLM_STUB_MODE=true (dev without real NPU), skip local LLM entirely.
+    # 2c. Update SOUL.md with context (no eval — DT is not told right/wrong).
+    # Always re-write on follow-up turns (message present) so DT's system
+    # prompt stays fresh even after memory consolidation.
+    if message.strip() or _soul_context != _last_soul_content.get(learner_id):
+        await _update_soul_with_context(learner_id, _soul_context, mode)
+        _last_soul_content[learner_id] = _soul_context
+
+    # 3. Determine phase and build payload with phase marker.
+    #    Phase marker tells LLM which mode to use (see _TEACHER_SOUL).
+    if context.strip() and not message.strip():
+        _phase = "FIRST_QUESTION"
+        payload = f"[PHASE:{_phase}]\n{context}"
+    else:
+        _phase = "EVALUATE_ANSWER"
+        payload = f"[PHASE:{_phase}]\n" + (message or context or "")
+        # Attach exam context so the LLM picks the next question from the
+        # same paper rather than generating from its own knowledge.
+        _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
+        if _exam_ctx:
+            payload += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:2000]}"
+
+    # 4. Direct LLM call for NPU path (replaces DT AgentLoop profile switching + WS).
+    #    When the local LLM lock is available, call rkllama's OpenAI-compatible API
+    #    directly without going through DT AgentLoop.  This avoids profile switching,
+    #    bot restarts, and WS overhead.  If it fails or returns weak content, fall
+    #    through to the existing DeepSeek WS path.
     _llm_local = False
+    _skip_ws = False
     if os.getenv("RKLLM_STUB_MODE", "").lower() != "true":
         try:
             await asyncio.wait_for(_llm_lock.acquire(), timeout=5)
@@ -2825,162 +4066,281 @@ async def _tutor_chat_core(
         except asyncio.TimeoutError:
             pass
 
-    # ── Profile switching with cache: skip if DT already on the right profile ──
+    if _llm_local:
+        try:
+            _direct_content = await _direct_llm_teach(
+                phase=_phase,
+                learner_id=learner_id,
+                context=_soul_context or "",
+                message=message,
+                mode=mode,
+                trace_id=trace_id,
+                answer_key=_answer_keys.get(learner_id, ""),
+            )
+        except Exception:
+            _direct_content = ""
+            logger.warning("[%s] Direct NPU path failed, falling through to WS", trace_id)
+        finally:
+            _llm_lock.release()
+            _llm_local = False
+        if _direct_content and len(_direct_content.strip()) >= 20:
+            _skip_ws = True
+            result = {"ok": True, "content": _direct_content}
+            logger.info(
+                "[%s] Direct NPU path succeeded (%d chars), skipping WS",
+                trace_id,
+                len(_direct_content),
+            )
+
+    # ── Profile switching (DeepSeek cloud path only) ──
     global _last_llm_profile
     _profile_switched = False
-    if _llm_local:
-        if _last_llm_profile != ("rkllama", "r1-distill-1.5b"):
-            if await _switch_dt_profile("rkllama", "r1-distill-1.5b", trace_id):
-                _profile_switched = True
-                _last_llm_profile = ("rkllama", "r1-distill-1.5b")
-            else:
-                _llm_lock.release()
-                _llm_local = False
-    if not _llm_local:
+    if not _skip_ws:
         if _last_llm_profile != ("deepseek", "deepseek-v4-flash"):
             _profile_switched = await _switch_dt_profile("deepseek", "deepseek-v4-flash", trace_id)
             if _profile_switched:
                 _last_llm_profile = ("deepseek", "deepseek-v4-flash")
 
-    # DT AgentLoop captures LLM config at bot start time and never refreshes.
-    # After switching the catalog profile, stop the teacher bot so the next
-    # WS connection triggers a fresh start with the new config.
-    if _profile_switched:
-        await _DTTutorSession.close_all()  # cached WS sessions reconnect with new config
-        try:
-            async with httpx.AsyncClient(timeout=10) as _sc:
-                await _sc.delete(f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher")
-        except Exception:
-            pass
-
-    # 5. Send via persistent WS session pool (reuses connection per learner).
-    try:
-        _session = await _DTTutorSession.get(learner_id)
-        result = await _session.send_and_recv(payload, trace_id)
-
-        # 5b. Fallback chain: Local weak → DeepSeek; Cloud empty → retry once.
-        #     Both paths close the WS connection so the bot restarts with fresh config.
-        _MIN_CHARS = 20
-        _should_retry = False
-
-        # --- Local LLM weak → fallback to DeepSeek ---
-        if _llm_local and (
-            not result.get("ok") or len(result.get("content", "").strip()) < _MIN_CHARS
-        ):
-            logger.warning(
-                "[%s] Local model weak (len=%d), falling back to DeepSeek",
-                trace_id,
-                len(result.get("content", "")),
-            )
-            _llm_lock.release()
-            _llm_local = False
-            _should_retry = True
-
-        # --- Cloud returned empty → transient retry ---
-        # Even without local LLM, a cloud call can return empty when DT's
-        # provider config is stale (e.g. after binding change).  Closing the
-        # WS forces a bot restart that re-reads the catalog.
-        elif not _llm_local and not result.get("ok"):
-            logger.warning(
-                "[%s] Cloud returned empty (ok=%s), retrying once",
-                trace_id,
-                result.get("ok"),
-            )
-            _should_retry = True
-
-        if _should_retry:
-            # Ensure DT profile is on DeepSeek before retry
-            if _last_llm_profile != ("deepseek", "deepseek-v4-flash"):
-                _profile_switched = await _switch_dt_profile(
-                    "deepseek", "deepseek-v4-flash", trace_id
-                )
-                if _profile_switched:
-                    _last_llm_profile = ("deepseek", "deepseek-v4-flash")
-            # Close WS so the next get() triggers a fresh bot start
+        if _profile_switched:
             await _DTTutorSession.close_all()
             try:
                 async with httpx.AsyncClient(timeout=10) as _sc:
                     await _sc.delete(f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher")
             except Exception:
                 pass
-            _soul_ctx = _soul_context or _last_tutor_context.get(learner_id, "")
-            if _soul_ctx:
-                await _update_soul_with_context(learner_id, _soul_ctx, mode)
+
+    # 5. Send via persistent WS session pool (reuses connection per learner).
+    #    Skipped entirely when the direct NPU call succeeded.
+    if not _skip_ws:
+        try:
             _session = await _DTTutorSession.get(learner_id)
             result = await _session.send_and_recv(payload, trace_id)
 
-        # 6. Post-process: parse answer evaluation, polish guide mode.
-        pending_practice = []
-        if result.get("ok"):
-            content = result.get("content", "")
+            # 5b. Fallback chain: empty cloud response → retry once.
+            #     Close WS so the bot restarts with fresh config.
+            _MIN_CHARS = 20
+            _should_retry = False
 
-            # Parse answer evaluation marker [ANSWER:correct|wrong:kp_id]
-            cleaned, eval_result, eval_kp = _parse_answer_evaluation(content)
-            if eval_result and eval_kp:
-                content = cleaned
-                is_correct = eval_result == "correct"
-                await asyncio.to_thread(
-                    update_mastery,
-                    learner_id,
-                    eval_kp,
-                    is_correct,
-                    question="",
-                    user_answer="",
-                    correct_answer="",
-                )
-                # Schedule Ebbinghaus review based on updated level
-                kp_data = await asyncio.to_thread(get_mastery, learner_id, eval_kp)
-                await asyncio.to_thread(
-                    schedule_review, learner_id, eval_kp, kp_data.get("level", 0)
-                )
-                logger.info(
-                    "[%s] mastery update: %s %s=%s, review scheduled",
+            # --- Cloud returned empty → transient retry ---
+            if not result.get("ok"):
+                logger.warning(
+                    "[%s] Cloud returned empty (ok=%s), retrying once",
                     trace_id,
-                    learner_id,
-                    eval_kp,
-                    eval_result,
+                    result.get("ok"),
                 )
+                _should_retry = True
 
-                # Trigger practice if wrong answers exceed threshold
-                if not is_correct:
-                    pending_practice = await _trigger_practice_if_needed(
-                        learner_id, eval_kp, trace_id
+            if _should_retry:
+                # Ensure DT profile is on DeepSeek before retry
+                if _last_llm_profile != ("deepseek", "deepseek-v4-flash"):
+                    _profile_switched = await _switch_dt_profile(
+                        "deepseek", "deepseek-v4-flash", trace_id
                     )
-
-                # Auto-trigger exam generation when weak points accumulate
+                    if _profile_switched:
+                        _last_llm_profile = ("deepseek", "deepseek-v4-flash")
+                # Close WS so the next get() triggers a fresh bot start
+                await _DTTutorSession.close_all()
                 try:
-                    weaks = await asyncio.to_thread(weak_points, learner_id)
-                    if len(weaks) >= 3:
-                        # Fire-and-forget: generate exam in background
-                        asyncio.create_task(_auto_generate_exam(learner_id, trace_id))
+                    async with httpx.AsyncClient(timeout=10) as _sc:
+                        await _sc.delete(f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher")
                 except Exception:
                     pass
+                _soul_ctx = _soul_context or _last_tutor_context.get(learner_id, "")
+                if _soul_ctx:
+                    await _update_soul_with_context(learner_id, _soul_ctx, mode, force=True)
+                _session = await _DTTutorSession.get(learner_id)
+                result = await _session.send_and_recv(payload, trace_id)
+        except Exception as e:
+            logger.error("[%s] TutorBot WS failed: %s", trace_id, e)
+            return {"ok": False, "error": f"教学引擎响应失败: {e}"}
+        finally:
+            if _llm_local:
+                _llm_lock.release()
 
-            if mode == "guide":
-                content = _polish_guide_response(content)
-            result["content"] = content
+    # 6. Post-process: parse markers, evaluate (extract + compare), record mastery.
+    #    Shared between direct NPU and cloud WS paths.
+    if result.get("ok"):
+        content: str = str(result.get("content") or "")
 
-        # 7. Persist context + question number: 每次教学交互后保存,
-        #    确保孩子隔天回来也能从中断处继续.
-        if result.get("ok") and _last_tutor_context.get(learner_id):
-            _save_context_to_disk(learner_id)
+        # Parse and store [ANSWER_KEY:] marker (for future use if LLM outputs it)
+        _ak_m = _ANSWER_KEY_RE.search(content)
+        if _ak_m:
+            _answer_keys[learner_id] = _ak_m.group(1).strip()
+            logger.info(
+                "[%s] Stored answer key for %s: %s",
+                trace_id,
+                learner_id,
+                _answer_keys[learner_id],
+            )
+        content = _ANSWER_KEY_RE.sub("", content).strip()
 
-        logger.info(
-            "[%s] tutor_chat timing: bot_setup=%.2fs total=%.2fs msg=%s profile_switched=%s",
-            trace_id,
-            _t_bot - _t_start,
-            time.time() - _t_start,
-            message[:30],
-            _profile_switched,
-        )
-        result["pending_practice"] = pending_practice
-        return result
-    except Exception as e:
-        logger.error("[%s] TutorBot failed: %s", trace_id, e)
-        return {"ok": False, "error": f"教学引擎响应失败: {e}"}
-    finally:
-        if _llm_local:
-            _llm_lock.release()
+        # Parse and store [KP_ID:] marker
+        _kp_m = _KP_ID_RE.search(content)
+        if _kp_m:
+            _kp_names[learner_id] = _kp_m.group(1).strip()
+            logger.info(
+                "[%s] Stored KP for %s: %s",
+                trace_id,
+                learner_id,
+                _kp_names[learner_id],
+            )
+        content = _KP_ID_RE.sub("", content).strip()
+        # Parse old-style [ANSWER:correct|wrong:kp_id] markers BEFORE stripping.
+        # DT may still output these (its own evaluation); capture for path 2 below.
+        _dt_eval_result = ""
+        _dt_eval_kp = ""
+        _dt_eval_m = _ANSWER_CLEAN_RE.search(content)
+        if _dt_eval_m:
+            _dt_eval_result = _dt_eval_m.group(1)  # "correct" or "wrong"
+            _dt_eval_kp = _dt_eval_m.group(2).strip()
+            logger.info(
+                "[%s] DT self-eval: %s kp=%s",
+                trace_id,
+                _dt_eval_result,
+                _dt_eval_kp,
+            )
+        content = _ANSWER_CLEAN_RE.sub("", content).strip()
+
+        # Fallback: parse KP name from 【知识点：XXX】 if no [KP_ID:] marker
+        if _kp_m is None:
+            _zp = re.search(r"【知识点：([^】]+)】", content)
+            if _zp:
+                _kp_names[learner_id] = _zp.group(1).strip()
+
+        # === Platform Evaluation ===
+        # Three paths, in priority order:
+        #   1. Step 2b answer-key comparison (most reliable, no LLM bias)
+        #   2. DT's self-eval marker [ANSWER:correct|wrong:kp_id]
+        #   3. Extract correct answer from DT's explanation text (fragile)
+        _do_eval = False
+        _is_correct = False
+        _correct_answer = ""
+        _eval_kp_used = _kp_names.get(learner_id, "")
+
+        if _mastery_eval is not None:
+            # Path 1: Step 2b had a stored answer key — use it
+            _do_eval = True
+            _is_correct = bool(_mastery_eval["is_correct"])
+            _correct_answer = str(_mastery_eval.get("correct_answer", ""))
+            _eval_kp_used = _eval_kp or _eval_kp_used
+        elif _dt_eval_result:
+            # Path 2: DT evaluated itself via [ANSWER:correct|wrong:kp_id]
+            _do_eval = True
+            _is_correct = _dt_eval_result == "correct"
+            _correct_answer = _dt_eval_result  # placeholder, actual answer unknown
+            if _dt_eval_kp:
+                _eval_kp_used = _dt_eval_kp
+            logger.info(
+                "[%s] DT self-eval used: correct=%s kp=%s",
+                trace_id,
+                _is_correct,
+                _eval_kp_used,
+            )
+        elif message.strip():
+            # No stored key — extract correct answer from DT's explanation
+            _correct_answer = _extract_correct_answer(content)
+            if _correct_answer:
+                _student = message.strip()
+                _is_correct = _match_answers(_student, _correct_answer)
+                _do_eval = True
+                logger.info(
+                    "[%s] Extracted eval: student=%s correct=%s is_correct=%s kp=%s",
+                    trace_id,
+                    message.strip(),
+                    _correct_answer,
+                    _is_correct,
+                    _eval_kp_used,
+                )
+
+        # Record mastery based on platform evaluation
+        if _do_eval and _eval_kp_used:
+            await asyncio.to_thread(
+                update_mastery,
+                learner_id,
+                _eval_kp_used,
+                _is_correct,
+                question=_last_question_text.get(learner_id, ""),
+                user_answer=message.strip(),
+                correct_answer=_correct_answer,
+            )
+            # Schedule Ebbinghaus review
+            kp_data = await asyncio.to_thread(get_mastery, learner_id, _eval_kp_used)
+            await asyncio.to_thread(
+                schedule_review, learner_id, _eval_kp_used, kp_data.get("level", 0)
+            )
+            logger.info(
+                "[%s] mastery update: %s %s correct=%s (platform eval)",
+                trace_id,
+                learner_id,
+                _eval_kp_used,
+                _is_correct,
+            )
+
+            # Auto-trigger exam generation when weak points accumulate
+            # (goes through notification channel, not inline — doesn't interrupt teaching)
+            try:
+                weaks = await asyncio.to_thread(weak_points, learner_id)
+                if len(weaks) >= 3:
+                    asyncio.create_task(_auto_generate_exam(learner_id, trace_id))
+            except Exception:
+                pass
+
+        if mode == "guide":
+            # P1: strip analysis leakage before polish
+            content = _strip_analysis(content, _phase)
+            content = _polish_guide_response(content)
+            # Inject correct answer prominently when the student just answered.
+            # Strip the LLM's inline 正确答案 first (it will appear in the
+            # platform's prominent banner above), avoiding duplication.
+            # Sources (in priority order):
+            #   1. _mastery_eval["correct_answer"] — stored [ANSWER_KEY:X] (most reliable)
+            #   2. _correct_answer from Path 3 extraction (real answer, not "correct"/"wrong")
+            #   3. Direct _extract_correct_answer() on polished content (last resort)
+            if _do_eval:
+                # Move the 正确答案 line to the end of the evaluation section
+                # (just before the next-question separator) so kids see the
+                # explanation first, then the answer prominently at the bottom.
+                _ans_m = re.search(r"^【?正确答案[：:].*$", content, flags=re.MULTILINE)
+                if _ans_m:
+                    _ans_line = _ans_m.group(0)
+                    content = content[: _ans_m.start()] + content[_ans_m.end() :]
+                    _sep_m = re.search(r"\n[-─—]{3,}\n", content)
+                    if _sep_m:
+                        content = (
+                            content[: _sep_m.start()]
+                            + f"\n═══════════════\n{_ans_line}\n═══════════════\n"
+                            + content[_sep_m.start() :]
+                        )
+                    else:
+                        content += f"\n\n═══════════════\n{_ans_line}\n═══════════════"
+                _answer_to_inject = ""
+                if _mastery_eval is not None:
+                    _answer_to_inject = str(_mastery_eval.get("correct_answer", ""))
+                elif _correct_answer and _correct_answer not in ("correct", "wrong"):
+                    _answer_to_inject = _correct_answer
+                else:
+                    _ans = _extract_correct_answer(content)
+                    if _ans:
+                        _answer_to_inject = _ans
+        result["content"] = content
+        # Extract and store question text for the next turn's mastery recording.
+        _q = _extract_question_text(content)
+        if _q:
+            _last_question_text[learner_id] = _q
+    # 7. Persist context + question number: 每次教学交互后保存,
+    #    确保孩子隔天回来也能从中断处继续.
+    if result.get("ok") and _last_tutor_context.get(learner_id):
+        _save_context_to_disk(learner_id)
+
+    logger.info(
+        "[%s] tutor_chat timing: bot_setup=%.2fs total=%.2fs msg=%s profile_switched=%s",
+        trace_id,
+        _t_bot - _t_start,
+        time.time() - _t_start,
+        message[:30],
+        _profile_switched,
+    )
+    return result
 
 
 @app.post("/api/llm/acquire")
@@ -3133,11 +4493,9 @@ async def api_vision_solve(request: Request):
         if not os.path.exists(actual_path):
             return {"ok": False, "error": f"图片文件不存在: {image_data}"}
 
-        import base64 as b64
-
         with open(actual_path, "rb") as f:
             raw = f.read()
-        image_data = b64.b64encode(raw).decode()
+        image_data = base64.b64encode(raw).decode()
 
     import websockets
 
@@ -3226,8 +4584,6 @@ class VisionRequest(BaseModel):
 
 @app.post("/api/ocr")
 async def api_ocr(req: OCRRequest, request: Request = None):
-    import base64 as b64
-
     tool_name = request.headers.get("X-Tool-Name", "") if request else ""
     image_data = req.image_data
     if "," in image_data and image_data.startswith("data:"):
@@ -3236,8 +4592,8 @@ async def api_ocr(req: OCRRequest, request: Request = None):
         try:
             from tutor_platform.tools.preprocess import preprocess_image_bytes
 
-            raw = b64.b64decode(image_data)
-            image_data = b64.b64encode(preprocess_image_bytes(raw)).decode()
+            raw = base64.b64decode(image_data)
+            image_data = base64.b64encode(preprocess_image_bytes(raw)).decode()
         except ImportError:
             pass
         except Exception:
@@ -3783,7 +5139,7 @@ async def api_push_exam(request: Request):
         f"共 {result.get('total', 0)} 道题\n\n"
         f"{exam_text[:1800]}"
     )
-    ok = _write_notification(learner_id, "exam", push_content)
+    ok = _write_notification(learner_id, "exam", push_content, target="child")
 
     result["pushed"] = ok
     result["trace_id"] = trace_id
@@ -3892,7 +5248,6 @@ async def get_bot_qrcode(refresh: bool = False, text_only: bool = False, bot_typ
     text_only=true 时返回 liteapp URL 文本而非二维码图片
     (用于绕过 WeChat CDN 上传导致的网关卡死问题)。
     """
-    import base64
     from io import BytesIO
 
     # 根据 bot_type 选择 token
@@ -3925,8 +5280,6 @@ async def get_bot_qrcode(refresh: bool = False, text_only: bool = False, bot_typ
         # 当 refresh=True 时禁止返回过期缓存（可能来自之前的子网关二维码或已过期的父网关二维码）
         cache = _qr_code_cache
         if cache.get(f"{bot_type}_png_b64") and not refresh:
-            import base64
-
             return Response(
                 content=base64.b64decode(cache[f"{bot_type}_png_b64"]),
                 media_type="image/png",

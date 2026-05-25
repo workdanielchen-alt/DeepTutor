@@ -37,11 +37,13 @@ export function getDayGroupKey(timestamp: number): DayGroupKey {
 }
 
 export function formatRelativeTime(timestamp: number, locale: string): string {
+  if (typeof timestamp !== "number" || !isFinite(timestamp)) return "";
   const diffSeconds = Math.round(timestamp - Date.now() / 1000);
   const formatter = new Intl.RelativeTimeFormat(locale || "en", {
     numeric: "auto",
   });
   const abs = Math.abs(diffSeconds);
+  if (!isFinite(diffSeconds)) return "";
   if (abs < 60) return formatter.format(diffSeconds, "second");
   if (abs < 3600)
     return formatter.format(Math.round(diffSeconds / 60), "minute");

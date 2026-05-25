@@ -33,11 +33,15 @@ services:
         - NEXT_PUBLIC_AUTH_ENABLED=false
     container_name: deeptutor
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
     environment:
       - PLATFORM_URL=http://platform:8100
+      - PLATFORM_API_URL=http://platform:8100
+      - FRONTEND_PORT=3790
     ports:
       - "${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}:${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}"
-      - "${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}:${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}"
+    # Frontend is served by host-side proxy + Next.js (port 3782).
 
     volumes:
       # Mount local data directory for persistence (read-write)
@@ -65,13 +69,14 @@ services:
       dockerfile: docker/platform/Dockerfile
     container_name: platform
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
     ports:
       - "8100:8100"
     environment:
       - PROVIDER_API_PORT=8100
       - DEVICE_MANAGER_URL=http://localhost:8101
       - DEVICE_MANAGER_PORT=8101
-      - DEVICE_IP=${DEVICE_IP}
       - DEEPTUTOR_API_URL=http://deeptutor:8001
       - DEEPTUTOR_URL=http://deeptutor:8001
       - MASTERY_DIR=/data/mastery
@@ -83,6 +88,9 @@ services:
       - CRON_INTERVAL_S=60
       - QUIZ_SYNC_INTERVAL_S=60
       - HERMES_CONTAINER=hermes_agent
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - RKLLM_STUB_MODE=true
+      - DEVICE_IP=127.0.0.1
     volumes:
       - ./data/mastery:/data/mastery
       - ./data/chromadb:/data/chromadb

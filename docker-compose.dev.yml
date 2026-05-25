@@ -41,9 +41,42 @@ services:
       retries: 3
       start_period: 10s
 
+  # ============================================
+  # Ollama — 本地 LLM (MiniCPM-V 4.6 与其他模型)
+  # ============================================
+  ollama:
+    image: ollama/ollama:0.30.0-rc23
+    container_name: ollama
+    restart: unless-stopped
+    # 宿主机 11434 已被 Windows Ollama 占用，映射到 11435
+    ports:
+      - "11435:11434"
+    environment:
+      - OLLAMA_MODELS=/models
+    volumes:
+      # 挂载已有的 MiniCPM-V 4.6 模型文件 (D:\ollama_models)
+      - //d/ollama_models:/models
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    networks:
+      - deeptutor-network
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   deeptutor:
     build:
       target: development
+    dns:
+      - 202.96.134.133
+      - 202.96.128.66
+    ports:
+      - "3782:3782"
 
     deploy:
       resources:
@@ -51,10 +84,13 @@ services:
           memory: 2G
 
     volumes:
-      # Mount backend source code for hot-reload
-      - ./deeptutor:/app/deeptutor:ro
-      - ./deeptutor_cli:/app/deeptutor_cli:ro
+      # Mount backend source code for hot-reload (from vendor)
+      - ./vendor/deeptutor/deeptutor:/app/deeptutor:ro
+      - ./vendor/deeptutor/deeptutor_cli:/app/deeptutor_cli:ro
       - ./scripts:/app/scripts:ro
+
+      # Mount tutor_platform for the OCR pipeline
+      - ./tutor_platform:/tutor_platform:ro
 
       # Mount frontend source for hot-reload
       - ./web/app:/app/web/app:ro
@@ -68,7 +104,7 @@ services:
 
       # Mount config files for hot-reload (tsconfig needs paths alias,
       # tailwind/postcss for dev compilation, next.config for env changes)
-      - ./web/tsconfig.json:/app/web/tsconfig.json:ro
+      - ./web/tsconfig.json:/app/web/tsconfig.json
       - ./web/tailwind.config.js:/app/web/tailwind.config.js:ro
       - ./web/postcss.config.js:/app/web/postcss.config.js:ro
       - ./web/next.config.js:/app/web/next.config.js:ro
@@ -96,6 +132,9 @@ services:
     image: deepseek-hermes_agent:latest
     container_name: hermes_agent
     restart: unless-stopped
+    dns:
+      - 202.96.134.133
+      - 202.96.128.66
     ports:
       - "8004:8004"
     deploy:
@@ -117,19 +156,21 @@ services:
       - API_SERVER_PORT=8004
       - API_SERVER_KEY=deepseek-local-key
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-8cfebec23e774bdab1020bbdce061fce}
+      - OPENAI_API_KEY=${DEEPSEEK_API_KEY:-sk-8cfebec23e774bdab1020bbdce061fce}
       - HERMES_AGENT_TIMEOUT=120
       - HERMES_API_TIMEOUT=30
       - HERMES_OPENAI_TIMEOUT=90
       - HERMES_HOME=/opt/data
+      - PLATFORM_API_URL=http://platform:8100
     volumes:
       - ./data_dev/hermes:/opt/data:rw
       - ./data_dev/hermes_child:/opt/data/child:rw
+      - ./data_dev/hermes:/data/hermes:ro
       - ./config/hermes_config.yaml:/opt/data/config.yaml:ro
-      - ./config/hermes_child_config.yaml:/opt/hermes/child/config.yaml:ro
+      - ./config/hermes_child_config.yaml:/opt/data/child/config.yaml:ro
       - ./vendor/hermes-agent/run_agent.py:/opt/hermes/run_agent.py:ro
       - ./vendor/hermes-agent/gateway/platforms/weixin.py:/opt/hermes/gateway/platforms/weixin.py:ro
       - ./docker/platform/gateway_start.sh:/opt/hermes/docker/gateway_start.sh:ro
-      - ./docker/platform/patches/gateway_run.py:/opt/hermes/gateway/run.py:ro
     command: bash /opt/hermes/docker/gateway_start.sh
     depends_on:
       rkllama:
@@ -150,6 +191,9 @@ services:
     image: deepseek-platform:latest
     container_name: platform
     restart: unless-stopped
+    dns:
+      - 202.96.134.133
+      - 202.96.128.66
     ports:
       - "8100:8100"
       - "8101:8101"
@@ -165,6 +209,8 @@ services:
       - DEEPTUTOR_URL=http://deeptutor:8001
       - HERMES_AGENT_URL=http://hermes_agent:8004
       - OLLAMA_URL=http://ollama:11434
+      - OCR_PROVIDER=ollama
+      - OLLAMA_OCR_MODEL=openbmb/minicpm-v4.6:q4_K_M
       - RKLLM_SERVER_URL=http://rkllama:8080
       - MASTERY_DIR=/data/mastery
       - CHROMA_PERSIST_DIR=/data/chromadb
@@ -178,6 +224,9 @@ services:
       - QUIZ_SYNC_INTERVAL_S=60
       - HERMES_CONTAINER=hermes_agent
       - DEVICE_IP=127.0.0.1
+      - WEIXIN_TOKEN=${WEIXIN_TOKEN}
+      - CHILD_WEIXIN_TOKEN=${CHILD_WEIXIN_TOKEN}
+      - PYTHONPATH=/vendor/hermes-agent:/
     volumes:
       # 挂载重建的 tutor_platform 和 domains 模块
       - ./tutor_platform:/tutor_platform:ro
@@ -199,6 +248,8 @@ services:
     depends_on:
       rkllama:
         condition: service_healthy
+      ollama:
+        condition: service_started
       deeptutor:
         condition: service_started
       hermes_agent:

@@ -84,8 +84,9 @@ const nextConfig = {
     NEXT_PUBLIC_AUTH_ENABLED,
   },
 
+  // Standalone output: self-contained server.js + minimal node_modules
+  // This eliminates the need to copy the full node_modules into Docker production images
   output: "standalone",
-  distDir: "./.next2",
 
   // Move dev indicator to bottom-right corner
   devIndicators: {
@@ -117,4 +118,6 @@ const nextConfig = {
   },
 };
 
+nextConfig.distDir = "D:/deepseek/web-build";
+nextConfig.cleanDistDir = true;
 module.exports = nextConfig;

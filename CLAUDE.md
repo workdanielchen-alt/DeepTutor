@@ -29,6 +29,7 @@
 当前已有 patch 文件：
 - `patches/deeptutor-math-animator-config.patch` — math_animator 配置兼容
 - `patches/deeptutor-rkllama-embedding.patch` — rkllama embedding provider
+- `patches/hermes-wechat-vendor.patch` — 通知路由 + 文件确认 + HA 其他修改 (原 hermes-wechat-file-ack + hermes-wechat-notification-routing 合并)
 
 ### 🟢 可正常修改 (项目自有代码)
 

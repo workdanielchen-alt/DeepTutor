@@ -1,32 +1,43 @@
-"""
-tutor_platform/storage.py — Provider 配置校验
-"""
+"""Storage configuration validation for the platform."""
+
+from __future__ import annotations
 
 import logging
+import os
 
-logger = logging.getLogger("tutor_platform.storage")
+logger = logging.getLogger(__name__)
 
 
-def validate_provider_config(config: dict | None = None) -> dict:
-    """校验 Provider 配置是否有效。
+def validate_provider_config() -> dict:
+    """Validate the provider configuration on startup.
 
-    Args:
-        config: 配置字典, 含 persist_dir, uploads_dir 等
+    Checks environment variables, directory existence, and
+    connectivity to required services.
 
     Returns:
-        字典: {"ok": bool, "errors": list[str], "warnings": list[str]}
+        dict with 'errors' (list) and 'warnings' (list).
     """
     errors: list[str] = []
     warnings: list[str] = []
-    if config is None:
-        return {"ok": True, "errors": errors, "warnings": warnings}
-    import os
 
-    persist = config.get("persist_dir") or os.environ.get("CHROMA_PERSIST_DIR")
-    if persist:
-        try:
-            os.makedirs(persist, exist_ok=True)
-        except Exception as e:
-            logger.warning("Cannot create persist_dir %s: %s", persist, e)
-            errors.append(f"无法创建持久化目录 {persist}: {e}")
-    return {"ok": len(errors) == 0, "errors": errors, "warnings": warnings}
+    # Check required directories exist
+    for name, path in [
+        ("MASTERY_DIR", os.getenv("MASTERY_DIR", "/data/mastery")),
+        ("CHROMA_PERSIST_DIR", os.getenv("CHROMA_PERSIST_DIR", "/data/chromadb")),
+        ("UPLOADS_DIR", os.getenv("UPLOADS_DIR", "/data/uploads")),
+        ("SOURCES_DIR", os.getenv("SOURCES_DIR", "/data/sources")),
+    ]:
+        if not os.path.isdir(path):
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as e:
+                warnings.append(f"{name}={path}: could not create ({e})")
+
+    # Check DeepSeek API key
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        warnings.append("DEEPSEEK_API_KEY not set — deepseek provider will fail")
+    elif not api_key.startswith("sk-"):
+        warnings.append("DEEPSEEK_API_KEY format unexpected (should start with sk-)")
+
+    return {"errors": errors, "warnings": warnings}

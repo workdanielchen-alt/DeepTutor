@@ -56,7 +56,7 @@
 │  │  ◆ 家长/孩子双机器人身份             │                              │
 │  │  ◆ 消息分类: OCR/教学/闲聊/设备      │                              │
 │  │  ◆ teaching_sessions 会话管理        │                              │
-│  │  ◆ 通知文件消费 (report_push)        │                              │
+│  │  ◆ 通知文件消费 (按 target 路由: 报告→家长, 练习→孩子)         │
 │  └──────────────────┬───────────────────┘                              │
 │                     │ HTTP REST                                        │
 │                     ▼                                                  │
@@ -104,7 +104,7 @@
 │  │    ingest_status.py     — 入库状态追踪                            │  │
 │  │    report_scheduler.py  — 报告调度                                │  │
 │  │    report_push.py       — 报告格式化                              │  │
-│  │    ha_client.py         — HA API 客户端 (cron 注册)              │  │
+│  │    ha_client.py         — HA API 客户端 (MCP 工具调用封装)           │  │
 │  │    quiz_sync.py         — 答题记录同步                            │  │
 │  │    storage.py           — 配置校验                                │  │
 │  │    tools/embeddings.py  — Embedding 函数                          │  │
@@ -167,7 +167,7 @@
 | `_teaching_sessions` dict | 跟踪活跃教学会话 (30min TTL) |
 | `_auto_process_media` | 拦截图片 → platform OCR + 教学 |
 | `_auto_teaching_followup` | 学生文字回复路由到 DT (非本地 LLM) |
-| `_consume_report_notifications` | 后台任务 (30s 轮询) 消费通知文件 |
+| `_consume_report_notifications` | 后台任务 (30s 轮询) 消费通知文件, 按 target 字段路由 (parent→父网关, child→子网关) |
 | `_process_message` | 主分发: 媒体→OCR, 文字→教学/闲聊 |
 
 **教学会话生命周期：**
@@ -272,14 +272,20 @@ platform 的 `_parse_answer_evaluation()` 解析流程：
 2. 生成 3 道针对性练习题
 3. 通过 `pending_practice` 字段返回，HA 发送到微信
 
-#### 自动试卷生成
+#### 自动试卷生成 (双通道)
 
-当薄弱知识点 ≥3 个 (水平 < 0.6)：
-1. 后台任务 `_auto_generate_exam()` 触发 (24h 冷却)
-2. 读取全部薄弱点和错题记录
-3. 调用 DeepSeek API 生成 3 段式试卷 (选择题/填空题/解答题)
-4. 存入 `_pending_exam_context[learner_id]`
-5. 下次教学时注入 SOUL.md
+当薄弱知识点 ≥3 个 (水平 < 0.6)，有两个推送通道：
+
+**通道 A — 教学前注入 (实时)：**
+1. `_auto_generate_exam()` 触发 (24h 冷却)
+2. 生成试卷 → 存入 `_pending_exam_context[learner_id]`
+3. 下次教学时注入 SOUL.md，随教学流引导完成
+
+**通道 B — 通知推送 (定时):**
+1. `_periodic_task_loop()` 每天 20:00 后检查所有学习者
+2. 薄弱点 ≥3 个 → 调用 `_generate_exam_paper()` 生成强化试卷
+3. `_write_notification(target="child")` 写入通知文件
+4. 子网关 `_consume_report_notifications` 消费后推送到孩子微信
 
 #### Ebbinghaus 间隔复习
 
@@ -295,12 +301,23 @@ platform 的 `_parse_answer_evaluation()` 解析流程：
 
 #### SOUL.md 系统
 
-两种教学人格，通过 HTTP PATCH `/api/v1/tutorbot/teacher` 更新 DT 的 SOUL.md：
+两种教学人格，通过 HTTP `_patch_soul()` 更新 DT 的 SOUL.md：
 
 | 常量 | 模式 | 用途 |
 |------|------|------|
 | `_TEACHER_SOUL` | guide | 苏格拉底式引导教学 |
 | `_TEACHER_EXPLAIN_SOUL` | explain | 直接讲解模式 |
+
+**Persona 构建流程：**
+1. `_build_teaching_persona()` 组装教学上下文 → 返回完整 persona 文本
+2. `_update_soul_with_context()` 检查 `_last_persona[learner_id]` 缓存
+3. 未变更 → 跳过 HTTP 调用（避免每次教学交互的 PATCH 开销）
+4. 已变更 → `_patch_soul()` 执行 HTTP：
+   - `GET /api/v1/tutorbot/teacher` → 检测 SOUL.md 是否存在
+   - 200 → `PATCH /api/v1/tutorbot/teacher/soul` (增量更新)
+   - 404 → `POST /api/v1/tutorbot/teacher` → `PUT /api/v1/tutorbot/teacher/soul` (全量创建)
+5. 缓存更新：`_last_persona[learner_id] = _persona`
+6. 强制刷新：`force=True` 跳过缓存（用于 DT 教师 Bot 被删除后的重试路径）
 
 **SOUL.md 注入内容 (每次教学前)：**
 - 当前教学上下文 (OCR 提取的题目)
@@ -399,10 +416,14 @@ NPU LLM 服务，运行在 RK3576 NPU 上。
 答案评估 (每次教学交互):
   DT WebSocket 回复
        │
+       ├─ _extract_question_text()
+       │    └─ 从回复中提取最新题目文本 → 存入 _last_question_text[learner_id]
+       │        (下一轮 update_mastery 时传入, 确保错题记录包含题目全文)
+       │
        ├─ _parse_answer_evaluation()
        │    └─ 剥离 [ANSWER:correct|wrong:kp_id] 标记
        │
-       ├─ update_mastery(kp_id, correct)
+       ├─ update_mastery(kp_id, correct, question=_last_question_text[...])
        │    ├─ 更新 KPI 掌握度
        │    ├─ 记录答题历史
        │    ├─ 更新每日统计
@@ -414,26 +435,43 @@ NPU LLM 服务，运行在 RK3576 NPU 上。
        │
        └─ _auto_generate_exam() (后台)
             └─ 薄弱点 ≥3 & 24h 冷却 → 生成强化试卷
-                 └─ 存入 _pending_exam_context
+                 ├─ 存入 _pending_exam_context (教学前注入)
+                 └─ 每日 20:00 后 _periodic_task_loop 推送通知 (见下文)
 
 SOUL.md 注入 (每次教学前):
   _update_soul_with_context()
        │
-       ├─ ChromaDB 查询相关知识 → 注入
-       ├─ get_due_reviews() → Ebbinghaus 到期复习
-       ├─ weak_points() → 薄弱知识点摘要
-       ├─ get_wrong_answers() → 近期错题
-       └─ _pending_exam_context → 自动生成的试卷
+       ├─ _build_teaching_persona() → 组装完整 persona 文本
+       ├─ _last_persona[learner_id] 缓存比对
+       │    └─ 未变更 → 跳过 HTTP, 直接返回
+       │
+       ├─ _patch_soul(): GET → PATCH/POST+PUT → SOUL.md
+       │    ├─ ChromaDB 查询相关知识 → 注入
+       │    ├─ get_due_reviews() → Ebbinghaus 到期复习
+       │    ├─ weak_points() → 薄弱知识点摘要
+       │    ├─ get_wrong_answers() → 近期错题
+       │    └─ _pending_exam_context → 自动生成的试卷
+       │
+       └─ _last_persona[learner_id] = _persona (更新缓存)
 
-报告推送:
-  HA cron 触发 ──→ ha_client.py 注册
+定期任务 (platform 后台 60s tick):
+  _periodic_task_loop()
+       │
+       ├─ sync_quiz_to_mastery() (每 300s)
+       │    └─ 错题同步 → 掌握度更新
        │
        ├─ report_scheduler.py
        │    ├─ enumerate_learners()
-       │    ├─ generate_parent_report(days=N)
-       │    └─ _write_notification() → /data/hermes/notifications/
+       │    ├─ push_daily_reports() (每天 20:00 后, 北京时区)
+       │    ├─ push_weekly_reports() (周一 20:00 后)
+       │    ├─ push_monthly_reports() (每月 1 日 20:00 后)
+       │    └─ _write_notification(target="parent") → /data/hermes/notifications/
+       │
+       ├─ 强化试卷自动推送 (每天 20:00 后, 薄弱点 ≥3)
+       │    └─ _write_notification(target="child") → /data/hermes/notifications/
        │
        └─ weixin.py _consume_report_notifications()
+            ├─ 按 target 字段路由 (parent → 父网关, child → 子网关)
             └─ self.send() → 微信用户
 ```
 
@@ -568,3 +606,7 @@ SOUL.md 注入 (每次教学前):
 19. **基于规则 + LLM 兜底的设备管理** — `device_command` 先规则匹配，未分类时 LLM 处理
 
 20. **文件归档 trace_id 体系** — 所有上传文件以 `{trace_id}_{timestamp}_{filename}` 归档，支持 `view_source` 溯源
+
+21. **通知目标路由** — `_write_notification(target="parent"/"child")` 配合 HA 双网关，报告推家长，强化试卷推孩子，文件桥解耦两容器
+
+22. **后台 Periodic Loop** — `_periodic_task_loop()` 60s tick 模拟定时任务，文件 marker (`quiz_sync_last.txt`, `report_daily_last.txt` 等) 追踪执行状态，无外部 cron 依赖

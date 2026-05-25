@@ -156,6 +156,7 @@ COPY --from=frontend-builder /app/web/public/ ./web/public/
 # Copy application source code
 COPY vendor/deeptutor/deeptutor/ ./deeptutor/
 COPY vendor/deeptutor/deeptutor_cli/ ./deeptutor_cli/
+COPY tutor_platform/ /tutor_platform/
 COPY scripts/ ./scripts/
 COPY pyproject.toml ./
 COPY requirements/ ./requirements/
@@ -198,7 +199,7 @@ stdout_logfile=/dev/fd/1
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
-environment=PYTHONPATH="/app",PYTHONUNBUFFERED="1"
+environment=PYTHONPATH="/app:/tutor_platform",PYTHONUNBUFFERED="1"
 
 [program:frontend]
 command=/bin/bash /app/start-frontend.sh
@@ -224,10 +225,13 @@ BACKEND_PORT=${BACKEND_PORT:-8001}
 
 echo "[Backend]  🚀 Starting FastAPI backend on port ${BACKEND_PORT}..."
 
-# Run uvicorn directly - the application's logging system already handles:
-# 1. Console output (visible in docker logs)
-# 2. File logging to data/user/logs/ai_tutor_*.log
-exec python -m uvicorn deeptutor.api.main:app --host 0.0.0.0 --port ${BACKEND_PORT}
+# Apply platform extraction hook and start uvicorn in the SAME process so the
+# monkey-patch of extract_text_from_bytes survives into the server runtime.
+exec python -c "
+import scripts.extractor_platform_hook
+import uvicorn
+uvicorn.run('deeptutor.api.main:app', host='0.0.0.0', port=${BACKEND_PORT:-8001})
+"
 EOF
 
 RUN sed -i 's/\r$//' /app/start-backend.sh && chmod +x /app/start-backend.sh
@@ -397,6 +401,7 @@ COPY --from=frontend-builder /app/web/next.config.js ./web/next.config.js
 RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     git \
+    antiword \
     && rm -rf /var/lib/apt/lists/*
 
 # Install development Python packages
@@ -415,7 +420,7 @@ logfile_maxbytes=0
 pidfile=/var/run/supervisord.pid
 
 [program:backend]
-command=python -m uvicorn deeptutor.api.main:app --host 0.0.0.0 --port %(ENV_BACKEND_PORT)s --reload
+command=python -c "import os; import scripts.extractor_platform_hook; import uvicorn; uvicorn.run('deeptutor.api.main:app', host='0.0.0.0', port=int(os.environ.get('BACKEND_PORT', '8001')), reload=True)"
 directory=/app
 autostart=true
 autorestart=true
@@ -423,7 +428,7 @@ stdout_logfile=/dev/fd/1
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
-environment=PYTHONPATH="/app",PYTHONUNBUFFERED="1"
+environment=PYTHONPATH="/app:/tutor_platform",PYTHONUNBUFFERED="1"
 
 [program:frontend]
 command=/bin/bash -c "cd /app/web && node node_modules/next/dist/bin/next dev -H 0.0.0.0 -p ${FRONTEND_PORT:-3782}"

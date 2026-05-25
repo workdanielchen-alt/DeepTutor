@@ -318,5 +318,15 @@ scripts/test_teaching_chain.py
 # Stray files
 docker/platform/=1.6.0
 
-# Embedded git repos (model weights — manage via git submodule instead)
-vendor/DeepSeek-R1-Distill-Qwen-1.5B_RKLLM/
+# Vendor dependencies (pulled from upstream repos, not our code)
+vendor/
+
+# Next.js build artifacts (dev copies)
+web/.next-new/
+web/.next.old/
+web/.next2/
+
+# One-off debug / test files
+test_ocr.png
+test_scan.png
+tmp_inspect_weixin.py

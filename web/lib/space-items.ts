@@ -5,7 +5,6 @@ import {
   History,
   NotebookPen,
   Wand2,
-  BarChart3,
   type LucideIcon,
 } from "lucide-react";
 
@@ -13,8 +12,7 @@ export type SpaceItemKey =
   | "chat_history"
   | "notebooks"
   | "question_bank"
-  | "skills"
-  | "learning";
+  | "skills";
 
 export type SpaceMemoryFile = "summary" | "profile";
 
@@ -55,12 +53,5 @@ export const SPACE_ITEMS: SpaceItem[] = [
     label: "Skills",
     description: "Behavior playbooks that guide chat responses.",
     icon: Wand2,
-  },
-  {
-    key: "learning",
-    href: "/space/learning",
-    label: "Learning Progress",
-    description: "Track mastery, review weak points, and generate practice.",
-    icon: BarChart3,
   },
 ];

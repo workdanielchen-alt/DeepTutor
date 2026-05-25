@@ -1,153 +1,216 @@
-"""
-tutor_platform/unified_provider.py — UnifiedLocalProvider + ChromaDB 管理 (v7.0)
+"""Unified provider: LLM, OCR, vision, and vector store abstraction.
 
-管理 ChromaDB PersistentClient 单例，提供 collection CRUD、
-文件入库、知识库搜索和 Provider 生命周期管理。
+Provides a singleton provider instance that wraps Ollama/DeepSeek APIs,
+ChromaDB vector store, and OCR capabilities.
 """
 
-import os
+from __future__ import annotations
+
+import asyncio
+import base64
 import json
 import logging
-import threading
-from pathlib import Path
+import os
+from typing import Any
 
-logger = logging.getLogger("tutor_platform.unified_provider")
+import httpx
 
-CHROMA_PERSIST_DIR = os.environ.get("CHROMA_PERSIST_DIR", "/data/chromadb")
-UPLOADS_DIR = os.environ.get("UPLOADS_DIR", "/data/uploads")
-SOURCES_DIR = os.environ.get("SOURCES_DIR", "/data/sources")
+logger = logging.getLogger(__name__)
+
+_provider_instance: UnifiedLocalProvider | None = None
 
 
 class UnifiedLocalProvider:
-    """ChromaDB PersistentClient 封装。
+    """Unified provider for LLM, OCR, vision, and vector store operations."""
 
-    提供:
-      - collection 按 kb_name 自动创建/获取
-      - add / query / delete / count
-      - 文件入库 (ingest) — PDF/Office/文本 → chunk → 向量化
-      - Provider 生命周期管理
-    """
-
-    def __init__(self, persist_dir: str = CHROMA_PERSIST_DIR):
-        self._persist_dir = persist_dir
-        self._client = None
-        self._collections: dict[str, any] = {}
-        self._initialized = False
-        self._lock = threading.Lock()
-
-    def initialize(self):
-        """初始化 ChromaDB 客户端。"""
-        if self._initialized:
-            return
-        with self._lock:
-            if self._initialized:
-                return
-            try:
-                import chromadb
-                from chromadb.config import Settings
-                os.makedirs(self._persist_dir, exist_ok=True)
-                self._client = chromadb.PersistentClient(
-                    path=self._persist_dir,
-                    settings=Settings(anonymized_telemetry=False),
-                )
-                self._initialized = True
-                logger.info("ChromaDB initialized at %s", self._persist_dir)
-            except Exception as e:
-                logger.error("ChromaDB init failed: %s", e)
-                raise
-
-    def get_or_create_collection(self, kb_name: str, embedding_function=None):
-        """按 kb_name 获取或创建 collection。"""
-        self.initialize()
-        with self._lock:
-            if kb_name not in self._collections:
-                try:
-                    col = self._client.get_collection(kb_name)
-                except Exception:
-                    col = self._client.create_collection(
-                        name=kb_name,
-                        embedding_function=embedding_function,
-                    )
-                self._collections[kb_name] = col
-            return self._collections[kb_name]
-
-    def add_documents(self, kb_name: str, documents: list[str],
-                      metadatas: list[dict] = None, ids: list[str] = None,
-                      embedding_function=None):
-        """向知识库添加文档。"""
-        col = self.get_or_create_collection(kb_name, embedding_function)
-        col.add(
-            documents=documents,
-            metadatas=metadatas or [{}] * len(documents),
-            ids=ids or [f"doc_{i}" for i in range(len(documents))],
+    def __init__(self):
+        self._ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
+        self._deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        self._chroma_dir = os.getenv("CHROMA_PERSIST_DIR", "/data/chromadb")
+        self._client = httpx.AsyncClient(timeout=120)
+        self._ocr_model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
+        logger.info(
+            "UnifiedLocalProvider: ollama=%s chroma=%s",
+            self._ollama_url,
+            self._chroma_dir,
         )
 
-    def query(self, kb_name: str, query_texts: list[str], n_results: int = 5,
-              embedding_function=None) -> dict:
-        """搜索知识库。"""
+    async def ingest_text(
+        self,
+        content: str,
+        kb_name: str,
+        filename: str = "",
+        source: str = "",
+        trace_id: str = "",
+    ) -> dict:
+        """Ingest text content into the knowledge base."""
         try:
-            col = self.get_or_create_collection(kb_name, embedding_function)
-            return col.query(query_texts=query_texts, n_results=n_results)
+            import chromadb
+            from chromadb.config import Settings
+
+            os.makedirs(self._chroma_dir, exist_ok=True)
+            client = chromadb.PersistentClient(
+                path=self._chroma_dir,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            collection = client.get_or_create_collection(name=kb_name)
+
+            doc_id = f"{filename or 'text'}_{trace_id or id(content)}"
+            # Get embedding from Ollama
+            emb_resp = await self._client.post(
+                f"{self._ollama_url}/api/embeddings",
+                json={"model": "nomic-embed-text", "prompt": content[:512]},
+            )
+            if emb_resp.status_code == 200:
+                emb_data = emb_resp.json()
+                embedding = emb_data.get("embedding", [])
+                collection.add(
+                    embeddings=[embedding],
+                    documents=[content],
+                    ids=[doc_id],
+                    metadatas=[{"filename": filename, "source": source}],
+                )
+            return {"ok": True, "doc_id": doc_id}
         except Exception as e:
-            logger.warning("ChromaDB query failed: %s", e)
-            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+            logger.warning("Ingest text failed (non-fatal): %s", e)
+            return {"ok": False, "error": str(e)}
 
-    def delete_collection(self, kb_name: str):
-        """删除知识库。"""
-        self.initialize()
-        with self._lock:
-            try:
-                self._client.delete_collection(kb_name)
-                self._collections.pop(kb_name, None)
-            except Exception as e:
-                logger.warning("Delete collection %s failed: %s", kb_name, e)
-
-    def count(self, kb_name: str) -> int:
-        """返回集合中的文档数。"""
+    async def query(
+        self,
+        collection_name: str,
+        query_texts: list[str],
+        n_results: int = 5,
+    ) -> list[dict]:
+        """Query the vector store for relevant documents."""
         try:
-            col = self.get_or_create_collection(kb_name)
-            return col.count()
-        except Exception:
-            return 0
+            import chromadb
+            from chromadb.config import Settings
 
-    def close(self):
-        """关闭客户端。"""
-        with self._lock:
-            self._collections.clear()
-            self._client = None
-            self._initialized = False
+            os.makedirs(self._chroma_dir, exist_ok=True)
+            client = chromadb.PersistentClient(
+                path=self._chroma_dir,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            collection = client.get_or_create_collection(name=collection_name)
 
-    @property
-    def client(self):
-        self.initialize()
-        return self._client
+            emb_resp = await self._client.post(
+                f"{self._ollama_url}/api/embeddings",
+                json={"model": "nomic-embed-text", "prompt": query_texts[0][:512]},
+            )
+            if emb_resp.status_code != 200:
+                return []
+            emb_data = emb_resp.json()
+            embedding = emb_data.get("embedding", [])
+            if not embedding:
+                return []
 
+            results = collection.query(
+                query_embeddings=[embedding],
+                n_results=n_results,
+            )
+            docs = []
+            for i, doc in enumerate(results.get("documents", [[]])[0]):
+                meta = (results.get("metadatas", [[]])[0] or {}) if results.get("metadatas") else {}
+                docs.append({"content": doc, "metadata": meta})
+            return docs
+        except Exception as e:
+            logger.warning("Vector query failed (non-fatal): %s", e)
+            return []
 
-# ── 全局单例 ──
+    async def ocr(
+        self,
+        image_data: str,
+        language: str = "zh",
+        return_formulas: bool = True,
+        return_layout: bool = True,
+        tool_name: str = "",
+    ) -> str:
+        """OCR an image using the configured multimodal LLM."""
+        try:
+            img_bytes = base64.b64decode(image_data)
+            img_b64 = base64.b64encode(img_bytes).decode("ascii")
+            prompt = (
+                "Transcribe all visible text from this image exactly as written, "
+                "preserving the original language, paragraphs, and line breaks. "
+                "Return only the transcribed text."
+            )
+            payload = {
+                "model": self._ocr_model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                            },
+                        ],
+                    }
+                ],
+                "stream": False,
+            }
+            resp = await self._client.post(
+                f"{self._ollama_url}/v1/chat/completions",
+                json=payload,
+            )
+            if resp.status_code != 200:
+                logger.warning("OCR failed: HTTP %d", resp.status_code)
+                return ""
+            data = resp.json()
+            return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        except Exception as e:
+            logger.warning("OCR failed: %s", e)
+            return ""
 
-_instance: UnifiedLocalProvider | None = None
-_instance_lock = threading.Lock()
+    async def vision(
+        self,
+        image_data: str,
+        question: str = "",
+        tool_name: str = "",
+    ) -> str:
+        """Vision QA using multimodal LLM."""
+        try:
+            prompt = question or "Describe what you see in this image."
+            payload = {
+                "model": self._ocr_model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_data},
+                            },
+                        ],
+                    }
+                ],
+                "stream": False,
+            }
+            resp = await self._client.post(
+                f"{self._ollama_url}/v1/chat/completions",
+                json=payload,
+            )
+            if resp.status_code != 200:
+                logger.warning("Vision failed: HTTP %d", resp.status_code)
+                return ""
+            data = resp.json()
+            return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        except Exception as e:
+            logger.warning("Vision failed: %s", e)
+            return ""
 
 
 def get_provider_instance() -> UnifiedLocalProvider:
-    """获取 UnifiedLocalProvider 全局单例。"""
-    global _instance
-    if _instance is None:
-        with _instance_lock:
-            if _instance is None:
-                _instance = UnifiedLocalProvider()
-                _instance.initialize()
-    return _instance
+    """Get or create the singleton provider instance."""
+    global _provider_instance
+    if _provider_instance is None:
+        _provider_instance = UnifiedLocalProvider()
+    return _provider_instance
 
 
-def reset_provider_instance():
-    """重置全局单例（用于配置变更后重建）。"""
-    global _instance
-    with _instance_lock:
-        if _instance is not None:
-            try:
-                _instance.close()
-            except Exception:
-                pass
-            _instance = None
-    logger.info("UnifiedLocalProvider instance reset")
+def reset_provider_instance() -> None:
+    """Reset the provider singleton (forces re-initialization on next access)."""
+    global _provider_instance
+    _provider_instance = None

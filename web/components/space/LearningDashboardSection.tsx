@@ -27,6 +27,7 @@ import {
   generatePractice,
   generateExam,
   generateReport,
+  listLearners,
   type MasterySummary,
   type WeakPoint,
   type WrongAnswer,
@@ -35,7 +36,7 @@ import {
 } from "@/lib/platform-api";
 
 // ── Learner ID ───────────────────────────────────────────────
-// For now use a default — we'll wire to auth later.
+// Auto-detect on mount: use the first real learner, fall back to "default".
 const DEFAULT_LEARNER = "default";
 
 // ── Stat Card ────────────────────────────────────────────────
@@ -280,16 +281,56 @@ function ReportModal({
 
 // ── Main Dashboard Section ───────────────────────────────────
 
+const LS_KEY = "learning-dashboard-learner-id";
+
 export default function LearningDashboardSection() {
   const { t } = useTranslation();
 
-  // Data states
+  // Restore persisted learner ID from localStorage, fall back to "default"
+  const [learnerId, setLearnerId] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem(LS_KEY) || DEFAULT_LEARNER;
+    }
+    return DEFAULT_LEARNER;
+  });
+  const [allLearners, setAllLearners] = useState<string[]>([]);
   const [summary, setSummary] = useState<MasterySummary | null>(null);
   const [weakPoints, setWeakPoints] = useState<WeakPoint[]>([]);
   const [wrongAnswers, setWrongAnswers] = useState<WrongAnswer[]>([]);
   const [weeklyStats, setWeeklyStats] = useState<PeriodStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // ── Auto-detect learner on mount ──────────────────────────
+
+  useEffect(() => {
+    listLearners()
+      .then((ids) => {
+        const real = ids.filter((id) => !id.endsWith("_session"));
+        if (real.length > 0) {
+          setAllLearners(real);
+          // If current learnerId still exists in the list, keep it.
+          // Otherwise auto-select the first real learner.
+          setLearnerId((prev) => (real.includes(prev) ? prev : real[0]));
+        }
+      })
+      .catch(() => {
+        /* use default fallback */
+      });
+  }, []);
+
+  // ── Persist learnerId to localStorage whenever it changes ──
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem(LS_KEY, learnerId);
+    }
+  }, [learnerId]);
+
+  // ── Re-fetch when learner changes ──
+  useEffect(() => {
+    void loadAll(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [learnerId]);
 
   // Modal states
   const [practiceModal, setPracticeModal] = useState<{
@@ -315,10 +356,10 @@ export default function LearningDashboardSection() {
     setError(null);
     try {
       const [sum, weak, wrong, weekly] = await Promise.all([
-        fetchMasterySummary(DEFAULT_LEARNER),
-        fetchWeakPoints(DEFAULT_LEARNER),
-        fetchWrongAnswers(DEFAULT_LEARNER, undefined, 10),
-        fetchWeeklyStats(DEFAULT_LEARNER),
+        fetchMasterySummary(learnerId),
+        fetchWeakPoints(learnerId),
+        fetchWrongAnswers(learnerId, undefined, 10),
+        fetchWeeklyStats(learnerId),
       ]);
       setSummary(sum);
       setWeakPoints(weak);
@@ -329,11 +370,7 @@ export default function LearningDashboardSection() {
     } finally {
       setLoading(false);
     }
-  }, []);
-
-  useEffect(() => {
-    void loadAll(true);
-  }, [loadAll]);
+  }, [learnerId]);
 
   // ── Handlers ──────────────────────────────────────────────
 
@@ -341,7 +378,7 @@ export default function LearningDashboardSection() {
     async (kpId: string) => {
       setPracticeModal({ kpId, questions: [], loading: true });
       try {
-        const result = await generatePractice(DEFAULT_LEARNER, kpId);
+        const result = await generatePractice(learnerId, kpId);
         setPracticeModal({ kpId, questions: result.questions, loading: false });
       } catch {
         setPracticeModal((prev) =>
@@ -349,13 +386,13 @@ export default function LearningDashboardSection() {
         );
       }
     },
-    [],
+    [learnerId],
   );
 
   const handleExam = useCallback(async () => {
     setExamModal({ text: "", title: "生成中...", kps: [], loading: true });
     try {
-      const result = await generateExam(DEFAULT_LEARNER);
+      const result = await generateExam(learnerId);
       setExamModal({
         text: result.exam_text,
         title: result.title,
@@ -367,17 +404,17 @@ export default function LearningDashboardSection() {
         prev ? { ...prev, text: "生成失败", loading: false } : null,
       );
     }
-  }, []);
+  }, [learnerId]);
 
   const handleReport = useCallback(async (type: "daily" | "weekly" | "monthly") => {
     setReportModal({ content: "生成中...", type });
     try {
-      const text = await generateReport(DEFAULT_LEARNER, type);
+      const text = await generateReport(learnerId, type);
       setReportModal({ content: text || "暂无学习记录", type });
     } catch {
       setReportModal({ content: "生成失败", type });
     }
-  }, []);
+  }, [learnerId]);
 
   // ── Render ────────────────────────────────────────────────
 
@@ -432,13 +469,28 @@ export default function LearningDashboardSection() {
         title="学习进度"
         description="学习数据总览、薄弱知识点、错题本、练习与测试"
         action={
-          <button
-            onClick={() => loadAll(true)}
-            className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[13px] text-[var(--foreground)] hover:bg-[var(--muted)]/40"
-          >
-            <RefreshCw size={14} />
-            刷新
-          </button>
+          <div className="flex items-center gap-2">
+            {allLearners.length > 1 && (
+              <select
+                value={learnerId}
+                onChange={(e) => setLearnerId(e.target.value)}
+                className="max-w-[160px] truncate rounded-lg border border-[var(--border)] bg-[var(--card)] px-2.5 py-1.5 text-[12px] text-[var(--foreground)] outline-none"
+              >
+                {allLearners.map((id) => (
+                  <option key={id} value={id}>
+                    {id.includes("@") ? id.split("@")[0].slice(0, 8) + "..." : id}
+                  </option>
+                ))}
+              </select>
+            )}
+            <button
+              onClick={() => loadAll(true)}
+              className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[13px] text-[var(--foreground)] hover:bg-[var(--muted)]/40"
+            >
+              <RefreshCw size={14} />
+              刷新
+            </button>
+          </div>
         }
       />
 

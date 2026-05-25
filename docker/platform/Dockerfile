@@ -5,8 +5,14 @@
 
 FROM python:3.11-slim
 
-# Install avahi-utils for mDNS LAN discovery (avahi-publish-service → host avahi-daemon via D-Bus)
-RUN apt-get update && apt-get install -y avahi-utils && rm -rf /var/lib/apt/lists/*
+# Install avahi-utils for mDNS LAN discovery + antiword (old .doc) + catdoc (catppt for old .ppt)
+# libreoffice-writer converts old .doc → PDF for image/equation OCR via MiniCPM-V
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    avahi-utils \
+    antiword \
+    catdoc \
+    libreoffice-writer \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -29,7 +35,7 @@ COPY docker/platform/device_manager_api.py ./
 # Runtime environment
 ENV PROVIDER_API_PORT=8100
 ENV DEVICE_MANAGER_PORT=8101
-ENV PYTHONPATH=/vendor/hermes-agent
+ENV PYTHONPATH=/vendor/hermes-agent:/tutor_platform
 
 EXPOSE 8100 8101
 

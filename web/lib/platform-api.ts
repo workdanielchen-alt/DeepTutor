@@ -1,23 +1,10 @@
-/**
- * Platform API client — talks to the platform container (port 8100)
- * through Next.js rewrites (/api/platform/* → http://platform:8100/*).
- *
- * All paths are relative to /api/platform/ so they flow through the
- * rewrite proxy and keep the same origin (no CORS needed in production).
- */
-
-import { apiFetch } from "@/lib/api";
-
-// ── Types ────────────────────────────────────────────────────────
+// ── Types ────────────────────────────────────────────────────
 
 export interface MasterySummary {
-  total_kp: number;
-  mastered: number;
-  learning: number;
-  weak: number;
-  weak_kps: string[];
   total_questions: number;
   accuracy: number;
+  mastered: number;
+  total_kp: number;
 }
 
 export interface WeakPoint {
@@ -28,113 +15,65 @@ export interface WeakPoint {
 }
 
 export interface WrongAnswer {
-  kp_id: string;
   question: string;
   user_answer: string;
   correct_answer: string;
-  ts: number;
-}
-
-export interface DayStat {
-  date: string;
-  total: number;
-  correct: number;
-  wrong: number;
+  kp_id: string;
 }
 
 export interface PeriodStats {
-  days: number;
   total: number;
-  correct: number;
-  wrong: number;
   accuracy: number;
-  per_day: DayStat[];
-  weak_points: string[];
-}
-
-export interface AnswerRecord {
-  kp_id: string;
-  question: string;
-  user_answer: string;
-  correct_answer: string;
-  is_correct: boolean;
-  ts: number;
+  per_day: { date: string; total: number }[];
 }
 
 export interface PracticeQuestion {
   question: string;
-  options?: string[];
+  options: string[];
   answer: string;
   explanation?: string;
 }
 
-export interface PracticeResult {
-  ok: boolean;
-  kp_id: string;
-  questions: PracticeQuestion[];
-  total: number;
-  trace_id: string;
+// ── HTTP helpers ─────────────────────────────────────────────
+
+const BASE = "/api/platform";
+
+async function apiGet<T>(path: string): Promise<T> {
+  const res = await fetch(`${BASE}${path}`);
+  if (!res.ok) throw new Error(`请求失败 (${res.status})`);
+  return res.json();
 }
 
-export interface ExamSection {
-  type: string;
-  count: number;
-  questions: string[];
+async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`请求失败 (${res.status})`);
+  return res.json();
 }
 
-export interface ExamResult {
-  ok: boolean;
-  exam_text: string;
-  title: string;
-  kp_covered: string[];
-  total: number;
-  sections: ExamSection[];
-  trace_id: string;
+async function apiPostText(path: string, body: unknown): Promise<string> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`请求失败 (${res.status})`);
+  return res.text();
 }
 
-// ── Helpers ──────────────────────────────────────────────────────
-
-function platformUrl(path: string): string {
-  const normalized = path.startsWith("/") ? path : `/${path}`;
-  return `/api/platform${normalized}`;
-}
-
-async function asJson<T>(response: Response): Promise<T> {
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = await response.json();
-      if (body?.detail) detail = String(body.detail);
-    } catch {
-      /* ignore */
-    }
-    throw new Error(detail);
-  }
-  return response.json() as Promise<T>;
-}
-
-// ── Learners ─────────────────────────────────────────────────────
+// ── Mastery / Learner ───────────────────────────────────────
 
 export async function listLearners(): Promise<string[]> {
-  const resp = await apiFetch(platformUrl("/mastery/"));
-  return asJson<string[]>(resp);
+  return apiGet<string[]>("/mastery/");
 }
-
-// ── Mastery ──────────────────────────────────────────────────────
 
 export async function fetchMasterySummary(
   learnerId: string,
 ): Promise<MasterySummary> {
-  const resp = await apiFetch(platformUrl(`/mastery/${learnerId}`));
-  return asJson<MasterySummary>(resp);
-}
-
-export async function fetchWeakPoints(
-  learnerId: string,
-): Promise<WeakPoint[]> {
-  const resp = await apiFetch(platformUrl(`/mastery/${learnerId}/weak`));
-  const data = await asJson<{ weak_points: WeakPoint[] }>(resp);
-  return data.weak_points;
+  return apiGet<MasterySummary>(`/mastery/${learnerId}`);
 }
 
 export async function fetchWrongAnswers(
@@ -145,86 +84,64 @@ export async function fetchWrongAnswers(
   const params = new URLSearchParams();
   if (kpId) params.set("kp_id", kpId);
   params.set("limit", String(limit));
-  const resp = await apiFetch(
-    platformUrl(`/mastery/${learnerId}/wrong?${params}`),
+  return apiGet<WrongAnswer[]>(
+    `/mastery/${learnerId}/wrong?${params.toString()}`,
   );
-  return asJson<WrongAnswer[]>(resp);
+}
+
+export async function fetchWeakPoints(
+  learnerId: string,
+): Promise<WeakPoint[]> {
+  const data = await apiGet<{ weak_points: WeakPoint[] }>(
+    `/mastery/${learnerId}/weak`,
+  );
+  return data.weak_points;
 }
 
 export async function fetchWeeklyStats(
   learnerId: string,
 ): Promise<PeriodStats> {
-  const resp = await apiFetch(
-    platformUrl(`/mastery/${learnerId}/stats/weekly`),
-  );
-  return asJson<PeriodStats>(resp);
+  return apiGet<PeriodStats>(`/mastery/${learnerId}/stats/weekly`);
 }
 
 export async function fetchMonthlyStats(
   learnerId: string,
 ): Promise<PeriodStats> {
-  const resp = await apiFetch(
-    platformUrl(`/mastery/${learnerId}/stats/monthly`),
-  );
-  return asJson<PeriodStats>(resp);
+  return apiGet<PeriodStats>(`/mastery/${learnerId}/stats/monthly`);
 }
 
-export async function fetchAnswerHistory(
-  learnerId: string,
-  limit = 20,
-  kpId?: string,
-): Promise<AnswerRecord[]> {
-  const params = new URLSearchParams();
-  params.set("limit", String(limit));
-  if (kpId) params.set("kp_id", kpId);
-  const resp = await apiFetch(
-    platformUrl(`/mastery/${learnerId}/history?${params}`),
-  );
-  const data = await asJson<{ history: AnswerRecord[] }>(resp);
-  return data.history;
-}
-
-// ── Practice / Exam ──────────────────────────────────────────────
+// ── Practice / Exam / Report ────────────────────────────────
 
 export async function generatePractice(
   learnerId: string,
   kpId: string,
   count = 3,
-): Promise<PracticeResult> {
-  const resp = await apiFetch(platformUrl("/practice/generate"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ learner_id: learnerId, kp_id: kpId, count }),
+): Promise<{ questions: PracticeQuestion[] }> {
+  return apiPost("/practice/generate", {
+    learner_id: learnerId,
+    kp_id: kpId,
+    count,
   });
-  return asJson<PracticeResult>(resp);
 }
 
 export async function generateExam(
   learnerId: string,
-  kpId = "",
-  count = 10,
-): Promise<ExamResult> {
-  const resp = await apiFetch(platformUrl("/practice/exam"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ learner_id: learnerId, kp_id: kpId, count }),
+): Promise<{
+  exam_text: string;
+  title: string;
+  kp_covered: string[];
+}> {
+  return apiPost("/practice/exam", {
+    learner_id: learnerId,
   });
-  return asJson<ExamResult>(resp);
 }
-
-// ── Report ───────────────────────────────────────────────────────
 
 export async function generateReport(
   learnerId: string,
   type: "daily" | "weekly" | "monthly",
 ): Promise<string> {
-  const resp = await apiFetch(platformUrl("/report/generate"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ learner_id: learnerId, type }),
+  return apiPostText("/report/generate", {
+    learner_id: learnerId,
+    type,
   });
-  if (!resp.ok) {
-    throw new Error(`${resp.status} ${resp.statusText}`);
-  }
-  return resp.text();
 }

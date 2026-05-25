@@ -1,2 +1,14 @@
-# Parent Hermes gateway configuration
-# Configuration is primarily via environment variables
+# Hermes Agent Configuration
+model:
+  default: "deepseek-v4-flash"
+  provider: "custom"
+  base_url: "https://api.deepseek.com/v1"
+
+gateway:
+  enabled: true
+  platforms:
+    - weixin
+  auto_process_media: true
+
+storage:
+  home: /opt/data

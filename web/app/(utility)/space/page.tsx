@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
+import ChatHistorySection from "@/components/space/ChatHistorySection";
 
 export default function SpaceIndexPage() {
-  redirect("/space/chat-history");
+  return <ChatHistorySection />;
 }

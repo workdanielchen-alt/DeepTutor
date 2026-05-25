@@ -31,8 +31,15 @@ def enumerate_learners() -> list[str]:
     return sorted(learners)
 
 
-def _write_notification(learner_id: str, report_type: str, content: str) -> bool:
-    """写一条报告推送通知到共享目录，供 Hermes Agent 消费。"""
+def _write_notification(learner_id: str, report_type: str, content: str, target: str = "parent") -> bool:
+    """写一条报告推送通知到共享目录，供 Hermes Agent 消费。
+
+    Args:
+        learner_id: 学习者标识
+        report_type: 报告类型 ("daily" / "weekly" / "monthly" / "exam")
+        content: 推送文本
+        target: 目标网关 ("parent" → 家长, "child" → 孩子)
+    """
     try:
         notif_dir = Path(NOTIFICATION_DIR)
         notif_dir.mkdir(parents=True, exist_ok=True)
@@ -41,6 +48,7 @@ def _write_notification(learner_id: str, report_type: str, content: str) -> bool
             "learner_id": learner_id,
             "report_type": report_type,
             "content": content,
+            "target": target,
             "timestamp": time.time(),
         }
         notif_path = notif_dir / f"report_{learner_id}_{int(time.time())}.json"

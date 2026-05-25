@@ -628,14 +628,13 @@ export default function CoWriterPage() {
       const top = rect.top + marker.offsetTop - textarea.scrollTop;
       const left = rect.left + marker.offsetLeft - textarea.scrollLeft;
 
-      mirror.remove();
+      document.body.removeChild(mirror);
       return { top, left };
     },
     [],
   );
 
   const updateSelectionPopover = useCallback(() => {
-    if (isUnmountedRef.current) return;
     const textarea = textareaRef.current;
     if (!textarea) {
       hideSelectionPopover();
@@ -1421,7 +1420,7 @@ export default function CoWriterPage() {
       result.set(i + 1, spans[i].offsetTop);
     }
 
-    mirror.remove();
+    document.body.removeChild(mirror);
     return result;
   }, []);
 
