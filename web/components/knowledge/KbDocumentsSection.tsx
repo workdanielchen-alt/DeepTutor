@@ -129,7 +129,9 @@ export default function KbDocumentsSection({
         </button>
       </div>
 
-      <div className={`space-y-2 ${task?.kind === "upload" || task?.kind === "create" ? "" : "hidden"}`}>
+      {(task?.kind === "upload" || task?.kind === "create") &&
+        (task?.taskId || (task?.logs?.length ?? 0) > 0 || task?.executing) && (
+          <div className="space-y-2">
             <div className="flex items-center justify-between text-[11px] text-[var(--muted-foreground)]">
               <span>
                 {task?.label}
@@ -166,6 +168,7 @@ export default function KbDocumentsSection({
               </div>
             )}
           </div>
+        )}
 
       <KbUpdateHistory entries={history} onClear={onClearHistory} />
     </div>

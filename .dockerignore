@@ -82,6 +82,8 @@ yarn-error.log*
 # Next.js
 .next/
 web/.next/
+.next2/
+web/.next2/
 out/
 web/out/
 

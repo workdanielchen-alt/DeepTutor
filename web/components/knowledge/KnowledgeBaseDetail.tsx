@@ -171,52 +171,51 @@ export default function KnowledgeBaseDetail({
         </nav>
       </div>
 
-      {/* Body — all panels always in DOM, CSS visibility toggles active one.
-          Prevents React 19 concurrent-mode insertBefore crash from
-          conditional unmount/remount of large DOM subtrees. */}
-      <div className="relative min-h-0 flex-1 overflow-hidden">
-        <div className={`absolute inset-0 ${section === "files" ? "" : "hidden"}`}>
+      {/* Body */}
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {section === "files" ? (
           <KbFilesTab key={kb.name} kb={kb} task={displayTask} />
-        </div>
-        <div className={`absolute inset-0 overflow-y-auto px-6 py-5 ${section !== "files" ? "" : "hidden"}`}>
-          <div className={fullBleed ? "" : "mx-auto max-w-3xl"}>
-            <div className={section === "add" ? "" : "hidden"}>
-              <KbDocumentsSection
-                key={kb.name}
-                kb={kb}
-                uploadPolicy={uploadPolicy}
-                task={displayTask}
-                history={history}
-                onClearHistory={() => onClearHistory(kb.name)}
-                onUpload={(files) =>
-                  kb.read_only ? Promise.resolve() : onUpload(kb.name, files)
-                }
-              />
-            </div>
-            <div className={section === "versions" ? "" : "hidden"}>
-              <KbIndexVersionsSection
-                key={kb.name}
-                kb={kb}
-                task={displayTask}
-                onReindex={() =>
-                  kb.read_only ? Promise.resolve() : onReindex(kb.name)
-                }
-              />
-            </div>
-            <div className={section === "settings" ? "" : "hidden"}>
-              <KbSettingsSection
-                key={kb.name}
-                kb={kb}
-                onSetDefault={() =>
-                  kb.read_only ? Promise.resolve() : onSetDefault(kb.name)
-                }
-                onDelete={() =>
-                  kb.read_only ? Promise.resolve() : onDelete(kb.name)
-                }
-              />
+        ) : (
+          <div className="h-full overflow-y-auto px-6 py-5">
+            <div className={fullBleed ? "" : "mx-auto max-w-3xl"}>
+              {section === "add" && (
+                <KbDocumentsSection
+                  key={kb.name}
+                  kb={kb}
+                  uploadPolicy={uploadPolicy}
+                  task={displayTask}
+                  history={history}
+                  onClearHistory={() => onClearHistory(kb.name)}
+                  onUpload={(files) =>
+                    kb.read_only ? Promise.resolve() : onUpload(kb.name, files)
+                  }
+                />
+              )}
+              {section === "versions" && (
+                <KbIndexVersionsSection
+                  key={kb.name}
+                  kb={kb}
+                  task={displayTask}
+                  onReindex={() =>
+                    kb.read_only ? Promise.resolve() : onReindex(kb.name)
+                  }
+                />
+              )}
+              {section === "settings" && (
+                <KbSettingsSection
+                  key={kb.name}
+                  kb={kb}
+                  onSetDefault={() =>
+                    kb.read_only ? Promise.resolve() : onSetDefault(kb.name)
+                  }
+                  onDelete={() =>
+                    kb.read_only ? Promise.resolve() : onDelete(kb.name)
+                  }
+                />
+              )}
             </div>
           </div>
-        </div>
+        )}
       </div>
     </main>
   );

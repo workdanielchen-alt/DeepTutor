@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useRef, useState } from "react";
 import { apiUrl, wsUrl } from "@/lib/api";
 import type { ProgressInfo } from "@/lib/knowledge-helpers";
 
@@ -103,31 +103,33 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       socketsRef.current[kbName] = socket;
 
       socket.onmessage = (event) => {
-        if (!aliveRef.current) return;
-        try {
-          const raw = JSON.parse(event.data) as {
-            type?: string;
-            data?: ProgressInfo;
-          } & ProgressInfo;
-          const progress: ProgressInfo =
-            raw?.type === "progress" && raw.data ? raw.data : raw;
-          if (!progress || typeof progress !== "object") return;
-          if (
-            expectedTaskId &&
-            progress.task_id &&
-            progress.task_id !== expectedTaskId
-          ) {
-            return;
+        startTransition(() => {
+          if (!aliveRef.current) return;
+          try {
+            const raw = JSON.parse(event.data) as {
+              type?: string;
+              data?: ProgressInfo;
+            } & ProgressInfo;
+            const progress: ProgressInfo =
+              raw?.type === "progress" && raw.data ? raw.data : raw;
+            if (!progress || typeof progress !== "object") return;
+            if (
+              expectedTaskId &&
+              progress.task_id &&
+              progress.task_id !== expectedTaskId
+            ) {
+              return;
+            }
+            setProgress(kbName, progress);
+            const stage = progress.stage;
+            if (stage === "completed" || stage === "error") {
+              closeSocket(kbName);
+              onCompleteRef.current?.(kbName);
+            }
+          } catch {
+            // ignore malformed event
           }
-          setProgress(kbName, progress);
-          const stage = progress.stage;
-          if (stage === "completed" || stage === "error") {
-            closeSocket(kbName);
-            onCompleteRef.current?.(kbName);
-          }
-        } catch {
-          // ignore malformed event
-        }
+        });
       };
 
       socket.onerror = () => closeSocket(kbName);
@@ -163,123 +165,134 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       let settled = false;
 
       source.addEventListener("process_log", (event) => {
-        if (!aliveRef.current) return;
-        try {
-          const payload = JSON.parse((event as MessageEvent).data) as {
-            message?: string;
-          };
-          if (!payload.message) return;
-          setTasksByKb((prev) => {
-            const current = prev[kbName];
-            if (!current || current.taskId !== taskId) return prev;
-            return {
-              ...prev,
-              [kbName]: {
-                ...current,
-                logs: [...current.logs, payload.message!],
-              },
+        startTransition(() => {
+          if (!aliveRef.current) return;
+          try {
+            const payload = JSON.parse((event as MessageEvent).data) as {
+              message?: string;
             };
-          });
-        } catch {
-          // ignore malformed process log
-        }
+            if (!payload.message) return;
+            setTasksByKb((prev) => {
+              const current = prev[kbName];
+              if (!current || current.taskId !== taskId) return prev;
+              return {
+                ...prev,
+                [kbName]: {
+                  ...current,
+                  logs: [...current.logs, payload.message!],
+                },
+              };
+            });
+          } catch {
+            // ignore malformed process log
+          }
+        });
       });
 
       source.addEventListener("progress", (event) => {
-        if (!aliveRef.current) return;
-        try {
-          const payload = JSON.parse(
-            (event as MessageEvent).data,
-          ) as ProgressInfo;
-          setProgress(kbName, payload);
-        } catch {
-          // ignore malformed progress
-        }
+        startTransition(() => {
+          if (!aliveRef.current) return;
+          try {
+            const payload = JSON.parse(
+              (event as MessageEvent).data,
+            ) as ProgressInfo;
+            setProgress(kbName, payload);
+          } catch {
+            // ignore malformed progress
+          }
+        });
       });
 
       source.addEventListener("complete", () => {
-        if (!aliveRef.current) return;
-        settled = true;
-        setTasksByKb((prev) => {
-          const current = prev[kbName];
-          if (!current || current.taskId !== taskId) return prev;
-          const finalState = { ...current, executing: false };
-          const startedAt =
-            startedAtRef.current[`${kbName}:${taskId}`] ?? Date.now();
-          delete startedAtRef.current[`${kbName}:${taskId}`];
-          onTaskSettledRef.current?.(kbName, {
-            ...finalState,
-            status: "completed",
-            startedAt,
-            completedAt: Date.now(),
-          } as TaskState & {
-            startedAt: number;
-            completedAt: number;
-            status: "completed";
+        startTransition(() => {
+          if (!aliveRef.current) return;
+          settled = true;
+          setTasksByKb((prev) => {
+            const current = prev[kbName];
+            if (!current || current.taskId !== taskId) return prev;
+            const finalState = { ...current, executing: false };
+            const startedAt =
+              startedAtRef.current[`${kbName}:${taskId}`] ?? Date.now();
+            delete startedAtRef.current[`${kbName}:${taskId}`];
+            onTaskSettledRef.current?.(kbName, {
+              ...finalState,
+              status: "completed",
+              startedAt,
+              completedAt: Date.now(),
+            } as TaskState & {
+              startedAt: number;
+              completedAt: number;
+              status: "completed";
+            });
+            return { ...prev, [kbName]: finalState };
           });
-          return { ...prev, [kbName]: finalState };
+          closeSource(kbName);
+          onCompleteRef.current?.(kbName);
         });
-        closeSource(kbName);
-        onCompleteRef.current?.(kbName);
       });
 
       source.addEventListener("failed", (event) => {
-        if (!aliveRef.current) return;
-        settled = true;
-        let detail = "Task failed";
-        let details: string | undefined;
-        try {
-          const payload = JSON.parse((event as MessageEvent).data) as {
-            detail?: string;
-            details?: string;
-          };
-          detail = payload.detail || detail;
-          details = payload.details;
-        } catch {
-          // ignore malformed failure event
-        }
-        const composed = details ? `${detail}\n\n${details}` : detail;
-        setTasksByKb((prev) => {
-          const current = prev[kbName];
-          if (!current || current.taskId !== taskId) return prev;
-          const finalState = {
-            ...current,
-            executing: false,
-            error: composed,
-          };
-          const startedAt =
-            startedAtRef.current[`${kbName}:${taskId}`] ?? Date.now();
-          delete startedAtRef.current[`${kbName}:${taskId}`];
-          onTaskSettledRef.current?.(kbName, {
-            ...finalState,
-            startedAt,
-            completedAt: Date.now(),
-          } as TaskState & {
-            startedAt: number;
-            completedAt: number;
+        startTransition(() => {
+          if (!aliveRef.current) return;
+          settled = true;
+          let detail = "Task failed";
+          let details: string | undefined;
+          try {
+            const payload = JSON.parse((event as MessageEvent).data) as {
+              detail?: string;
+              details?: string;
+            };
+            detail = payload.detail || detail;
+            details = payload.details;
+          } catch {
+            // ignore malformed failure event
+          }
+          const composed = details ? `${detail}\n\n${details}` : detail;
+          setTasksByKb((prev) => {
+            const current = prev[kbName];
+            if (!current || current.taskId !== taskId) return prev;
+            const finalState = {
+              ...current,
+              executing: false,
+              error: composed,
+            };
+            const startedAt =
+              startedAtRef.current[`${kbName}:${taskId}`] ?? Date.now();
+            delete startedAtRef.current[`${kbName}:${taskId}`];
+            onTaskSettledRef.current?.(kbName, {
+              ...finalState,
+              startedAt,
+              completedAt: Date.now(),
+            } as TaskState & {
+              startedAt: number;
+              completedAt: number;
+            });
+            return { ...prev, [kbName]: finalState };
           });
-          return { ...prev, [kbName]: finalState };
+          closeSource(kbName);
+          onCompleteRef.current?.(kbName);
         });
-        closeSource(kbName);
-        onCompleteRef.current?.(kbName);
       });
 
       source.onerror = () => {
         if (settled) return;
-        setTasksByKb((prev) => {
-          const current = prev[kbName];
-          if (!current || current.taskId !== taskId) return prev;
-          if (!current.executing) return prev;
-          return {
-            ...prev,
-            [kbName]: {
-              ...current,
-              executing: false,
-              error: current.error || "Process log stream disconnected.",
-            },
-          };
+        startTransition(() => {
+          if (!aliveRef.current) return;
+          setTasksByKb((prev) => {
+            const current = prev[kbName];
+            if (!current || current.taskId !== taskId) return prev;
+            if (!current.executing) return prev;
+            return {
+              ...prev,
+              [kbName]: {
+                ...current,
+                executing: false,
+                error: current.error || "Process log stream disconnected.",
+              },
+            };
+          });
+          closeSource(kbName);
         });
-        closeSource(kbName);
       };
     },
     [closeSource, setProgress],

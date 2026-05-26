@@ -6,14 +6,12 @@
 FROM python:3.11-slim
 
 # Install avahi-utils for mDNS LAN discovery + antiword (old .doc) + catdoc (catppt for old .ppt)
-# libreoffice-writer converts old .doc → PDF for image/equation OCR via MiniCPM-V
 RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true \
     && sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null || true \
     && apt-get update && apt-get install -y --no-install-recommends \
     avahi-utils \
     antiword \
     catdoc \
-    libreoffice-writer \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

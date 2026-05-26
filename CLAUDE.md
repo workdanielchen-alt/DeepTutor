@@ -30,6 +30,7 @@
 - `patches/deeptutor-math-animator-config.patch` — math_animator 配置兼容
 - `patches/deeptutor-rkllama-embedding.patch` — rkllama embedding provider
 - `patches/hermes-wechat-vendor.patch` — 通知路由 + 文件确认 + HA 其他修改 (原 hermes-wechat-file-ack + hermes-wechat-notification-routing 合并)
+- `patches/knowledge-list-async.patch` — `/api/v1/knowledge/list` 同步 I/O 阻塞修复：将 KB 信息加载移至线程池
 
 ### 🟢 可正常修改 (项目自有代码)
 

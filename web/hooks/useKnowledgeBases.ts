@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, startTransition } from "react";
 import {
   createKnowledgeBase as createKbApi,
   deleteKnowledgeBase as deleteKbApi,
@@ -168,7 +168,9 @@ export function useKnowledgeBases() {
   useEffect(() => {
     if (!hasActiveWork) return;
     const interval = window.setInterval(() => {
-      void load({ force: true, showSpinner: false });
+      startTransition(() => {
+        void load({ force: true, showSpinner: false });
+      });
     }, 4000);
     return () => window.clearInterval(interval);
   }, [hasActiveWork, load]);

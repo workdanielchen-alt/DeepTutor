@@ -41,7 +41,7 @@ services:
       - FRONTEND_PORT=3790
     ports:
       - "${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}:${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}"
-    # Frontend is served by host-side proxy + Next.js (port 3782).
+      - "${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}:${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}"
 
     volumes:
       # Mount local data directory for persistence (read-write)

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslation } from "react-i18next";
 import { Loader2 } from "lucide-react";
 import { useKnowledgeBases } from "@/hooks/useKnowledgeBases";
@@ -11,6 +11,7 @@ import CreateKbModal from "./CreateKbModal";
 
 export default function KnowledgePage() {
   const { t } = useTranslation();
+  const router = useRouter();
   const searchParams = useSearchParams();
   const initialKb = searchParams.get("kb");
 
@@ -54,9 +55,6 @@ export default function KnowledgePage() {
   );
 
   // Keep ?kb=… in sync with the effective selection so deep links work.
-  // Uses history.replaceState instead of router.replace to avoid triggering a
-  // Next.js server re-render during concurrent client-side state updates, which
-  // can cause React 19's insertOrAppendPlacementNode to fail.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const current = searchParams.get("kb");
@@ -68,11 +66,8 @@ export default function KnowledgePage() {
       params.delete("kb");
     }
     const search = params.toString();
-    const id = setTimeout(() => {
-      window.history.replaceState(null, "", search ? `?${search}` : "?");
-    }, 0);
-    return () => clearTimeout(id);
-  }, [searchParams, selectedKbName]);
+    router.replace(search ? `?${search}` : "?", { scroll: false });
+  }, [router, searchParams, selectedKbName]);
 
   const handleCreate = useCallback(
     async (params: { name: string; provider: string; files: File[] }) => {
