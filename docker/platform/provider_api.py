@@ -1221,9 +1221,9 @@ def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
         return image_bytes  # can't decode, return raw
 
     try:
-        # Downscale: cap longest side at 1200px (OCR quality plateaus well before this,
-        # but preprocessing and inference cost scale with pixel count).
-        _MAX_DIM = 1200
+        # Downscale: cap longest side at 1800px. MiniCPM-V-4.6 supports up to
+        # 1.8M pixels natively; higher resolution improves dense exam-text OCR.
+        _MAX_DIM = 1800
         h, w = img.shape[:2]
         if max(h, w) > _MAX_DIM:
             scale = _MAX_DIM / max(h, w)
@@ -1286,6 +1286,7 @@ async def _ocr_image_bytes_ollama(image_bytes: bytes, trace_id: str) -> str:
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
     ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
     model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6")
+    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "15m")
     async with _ocr_semaphore:
         try:
             async with httpx.AsyncClient(timeout=120) as client:
@@ -1305,6 +1306,7 @@ async def _ocr_image_bytes_ollama(image_bytes: bytes, trace_id: str) -> str:
                             },
                         ],
                         "stream": False,
+                        "keep_alive": keep_alive,
                         "options": {"temperature": 0},
                     },
                 )
@@ -4294,15 +4296,22 @@ async def _tutor_chat_core(
             # 截断只保留第一题。截掉的部分在下一次 EVALUATE_ANSWER 时
             # 会被 DT Bot 自然选中（exam context 全程在 system prompt 中，
             # 截断后 conversation history 没那道题，DT Bot 不会跳过）。
+            #
+            # EVALUATE_ANSWER 阶段: 第一个「第N题」是对当前题目的引用 heading，
+            # 不是新题。需要 3+ 标记才截断（2+ 道新题才截）。
+            # FIRST_QUESTION 阶段: 所有标记都是新题，2+ 就截。
             _q_markers = [
-                m.start() for m in re.finditer(r'【第\d+题】|(?<=\n)第\d+题[：:]', content)
+                m.start() for m in re.finditer(
+                    r'【第\d+题】|^\s*第\d+题', content, re.MULTILINE,
+                )
             ]
-            if len(_q_markers) >= 2:
-                content = content[:_q_markers[1]].rstrip()
+            _q_threshold = 3 if _phase == "EVALUATE_ANSWER" else 2
+            if len(_q_markers) >= _q_threshold:
+                content = content[:_q_markers[_q_threshold - 1]].rstrip()
                 logger.warning(
                     "[%s] Multi-question DT response truncated "
-                    "(found %d markers, kept first only)",
-                    trace_id, len(_q_markers),
+                    "(found %d markers, phase=%s, kept up to marker %d)",
+                    trace_id, len(_q_markers), _phase, _q_threshold - 1,
                 )
 
             # P1: strip analysis leakage before polish
