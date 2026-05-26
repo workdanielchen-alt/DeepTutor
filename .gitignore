@@ -326,6 +326,13 @@ web/.next-new/
 web/.next.old
 web/.next2/
 
+# Build artifacts from Turbopack chunk extraction
+.next2-chunks/
+
+# Playwright test artifacts
+web/playwright-report/
+web/test-results/
+
 # One-off debug / test files
 test_ocr.png
 test_scan.png

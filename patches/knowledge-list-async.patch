@@ -1,0 +1,360 @@
+diff --git a/deeptutor/api/routers/knowledge.py b/deeptutor/api/routers/knowledge.py
+index f476182..8497ebf 100644
+--- a/deeptutor/api/routers/knowledge.py
++++ b/deeptutor/api/routers/knowledge.py
+@@ -757,142 +757,176 @@ async def set_default_kb(kb_name: str):
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ 
++def _load_kb_infos_sync(
++    kb_names: list[str],
++    own_prefix: str,
++    access_by_id: dict[str, dict],
++    is_admin: bool,
++) -> list[KnowledgeBaseInfo]:
++    """Run KB info loading synchronously in a thread pool to avoid blocking
++    the async event loop with disk I/O (kb_config.json, directory scans)."""
++    manager = get_kb_manager()
++    result: list[KnowledgeBaseInfo] = []
++    errors: list[str] = []
++
++    for name in kb_names:
++        try:
++            info = manager.get_info(name)
++            logger.debug(f"Successfully got info for KB '{name}': {info.get('statistics', {})}")
++            result.append(
++                KnowledgeBaseInfo(
++                    id=f"{own_prefix}{info['name']}",
++                    name=info["name"],
++                    is_default=info["is_default"],
++                    statistics=info.get("statistics", {}),
++                    metadata=info.get("metadata"),
++                    path=info.get("path"),
++                    status=info.get("status"),
++                    progress=info.get("progress"),
++                    source="admin" if is_admin else "user",
++                    assigned=False,
++                    read_only=False,
++                    provenance_label=access_by_id.get(f"{own_prefix}{info['name']}", {}).get(
++                        "provenance_label"
++                    ),
++                )
++            )
++        except Exception as e:
++            error_msg = f"Error getting info for KB '{name}': {e}"
++            errors.append(error_msg)
++            logger.warning(f"{error_msg}\n{traceback.format_exc()}")
++            try:
++                kb_dir = manager.base_dir / name
++                if kb_dir.exists():
++                    logger.debug(f"KB '{name}' directory exists, creating fallback info")
++                    result.append(
++                        KnowledgeBaseInfo(
++                            id=f"{own_prefix}{name}",
++                            name=name,
++                            is_default=name == manager.get_default(),
++                            statistics={
++                                "raw_documents": 0,
++                                "images": 0,
++                                "content_lists": 0,
++                                "rag_initialized": False,
++                            },
++                            metadata=None,
++                            path=str(kb_dir),
++                            status="unknown",
++                            progress=None,
++                            source="admin" if is_admin else "user",
++                        )
++                    )
++            except Exception as fallback_err:
++                logger.error(f"Fallback also failed for KB '{name}': {fallback_err}")
++
++    if errors and not result:
++        error_detail = f"Failed to load knowledge bases. Errors: {'; '.join(errors)}"
++        logger.error(error_detail)
++        raise RuntimeError(error_detail)
++
++    if errors:
++        logger.warning(
++            f"Some KBs had errors, returning {len(result)} results. Errors: {errors}"
++        )
++
++    return result
++
++
++def _load_assigned_kbs_sync(
++    access_items: list[dict],
++    own_ids: set[str],
++    is_admin: bool,
++) -> list[KnowledgeBaseInfo]:
++    """Load assigned KBs from admin access entries."""
++    result: list[KnowledgeBaseInfo] = []
++    for access in access_items:
++        if access.get("source") != "admin" or access.get("id") in own_ids:
++            continue
++        if not access.get("available", True):
++            result.append(
++                KnowledgeBaseInfo(
++                    id=str(access.get("id") or ""),
++                    name=str(access.get("name") or ""),
++                    is_default=False,
++                    statistics={},
++                    metadata={},
++                    path=None,
++                    status="unavailable",
++                    progress=None,
++                    source="admin",
++                    assigned=True,
++                    read_only=True,
++                    provenance_label=str(access.get("provenance_label") or ""),
++                    available=False,
++                )
++            )
++            continue
++        resource = resolve_kb(str(access.get("id") or access.get("name") or ""))
++        assigned_manager = manager_for_resource(resource)
++        try:
++            info = assigned_manager.get_info(resource.name)
++            result.append(
++                KnowledgeBaseInfo(
++                    id=resource.id,
++                    name=info["name"],
++                    is_default=False,
++                    statistics=info.get("statistics", {}),
++                    metadata=info.get("metadata"),
++                    path=None,
++                    status=info.get("status"),
++                    progress=info.get("progress"),
++                    source="admin",
++                    assigned=True,
++                    read_only=True,
++                    provenance_label=str(access.get("provenance_label") or ""),
++                )
++            )
++        except Exception:
++            result.append(
++                KnowledgeBaseInfo(
++                    id=resource.id,
++                    name=resource.name,
++                    is_default=False,
++                    statistics={},
++                    metadata={},
++                    status="unknown",
++                    source="admin",
++                    assigned=True,
++                    read_only=True,
++                    provenance_label=str(access.get("provenance_label") or ""),
++                )
++            )
++    return result
++
++
+ @router.get("/list", response_model=list[KnowledgeBaseInfo])
+ async def list_knowledge_bases():
+     """List all available knowledge bases with their details."""
+     try:
+-        manager = get_kb_manager()
+-        kb_names = manager.list_knowledge_bases()
++        loop = asyncio.get_event_loop()
++
++        # Run synchronous disk I/O in the default thread pool so it does not
++        # block the async event loop.
++        kb_names = await loop.run_in_executor(None, get_kb_manager().list_knowledge_bases)
+         access_items = list_visible_kb_access()
+         access_by_id = {str(item.get("id") or ""): item for item in access_items}
+-        own_prefix = "admin:kb:" if get_current_user().is_admin else "user:kb:"
++        is_admin = get_current_user().is_admin
++        own_prefix = "admin:kb:" if is_admin else "user:kb:"
+ 
+         logger.debug(f"Found {len(kb_names)} knowledge bases: {kb_names}")
+ 
+-        result = []
+-        errors = []
+-
+-        for name in kb_names:
+-            try:
+-                info = manager.get_info(name)
+-                logger.debug(f"Successfully got info for KB '{name}': {info.get('statistics', {})}")
+-                result.append(
+-                    KnowledgeBaseInfo(
+-                        id=f"{own_prefix}{info['name']}",
+-                        name=info["name"],
+-                        is_default=info["is_default"],
+-                        statistics=info.get("statistics", {}),
+-                        metadata=info.get("metadata"),
+-                        path=info.get("path"),
+-                        status=info.get("status"),
+-                        progress=info.get("progress"),
+-                        source="admin" if get_current_user().is_admin else "user",
+-                        assigned=False,
+-                        read_only=False,
+-                        provenance_label=access_by_id.get(f"{own_prefix}{info['name']}", {}).get(
+-                            "provenance_label"
+-                        ),
+-                    )
+-                )
+-            except Exception as e:
+-                error_msg = f"Error getting info for KB '{name}': {e}"
+-                errors.append(error_msg)
+-                logger.warning(f"{error_msg}\n{traceback.format_exc()}")
+-                try:
+-                    kb_dir = manager.base_dir / name
+-                    if kb_dir.exists():
+-                        logger.debug(f"KB '{name}' directory exists, creating fallback info")
+-                        result.append(
+-                            KnowledgeBaseInfo(
+-                                id=f"{own_prefix}{name}",
+-                                name=name,
+-                                is_default=name == manager.get_default(),
+-                                statistics={
+-                                    "raw_documents": 0,
+-                                    "images": 0,
+-                                    "content_lists": 0,
+-                                    "rag_initialized": False,
+-                                },
+-                                metadata=None,
+-                                path=str(kb_dir),
+-                                status="unknown",
+-                                progress=None,
+-                                source="admin" if get_current_user().is_admin else "user",
+-                            )
+-                        )
+-                except Exception as fallback_err:
+-                    logger.error(f"Fallback also failed for KB '{name}': {fallback_err}")
+-
+-        if errors and not result:
+-            error_detail = f"Failed to load knowledge bases. Errors: {'; '.join(errors)}"
+-            logger.error(error_detail)
+-            raise HTTPException(status_code=500, detail=error_detail)
+-
+-        if errors:
+-            logger.warning(
+-                f"Some KBs had errors, returning {len(result)} results. Errors: {errors}"
+-            )
++        result = await loop.run_in_executor(
++            None, _load_kb_infos_sync, kb_names, own_prefix, access_by_id, is_admin
++        )
+ 
+         logger.debug(f"Returning {len(result)} knowledge bases")
+-        if not get_current_user().is_admin:
++        if not is_admin:
+             own_ids = {item.id for item in result}
+-            for access in access_items:
+-                if access.get("source") != "admin" or access.get("id") in own_ids:
+-                    continue
+-                if not access.get("available", True):
+-                    result.append(
+-                        KnowledgeBaseInfo(
+-                            id=str(access.get("id") or ""),
+-                            name=str(access.get("name") or ""),
+-                            is_default=False,
+-                            statistics={},
+-                            metadata={},
+-                            path=None,
+-                            status="unavailable",
+-                            progress=None,
+-                            source="admin",
+-                            assigned=True,
+-                            read_only=True,
+-                            provenance_label=str(access.get("provenance_label") or ""),
+-                            available=False,
+-                        )
+-                    )
+-                    continue
+-                resource = resolve_kb(str(access.get("id") or access.get("name") or ""))
+-                assigned_manager = manager_for_resource(resource)
+-                try:
+-                    info = assigned_manager.get_info(resource.name)
+-                    result.append(
+-                        KnowledgeBaseInfo(
+-                            id=resource.id,
+-                            name=info["name"],
+-                            is_default=False,
+-                            statistics=info.get("statistics", {}),
+-                            metadata=info.get("metadata"),
+-                            path=None,
+-                            status=info.get("status"),
+-                            progress=info.get("progress"),
+-                            source="admin",
+-                            assigned=True,
+-                            read_only=True,
+-                            provenance_label=str(access.get("provenance_label") or ""),
+-                        )
+-                    )
+-                except Exception:
+-                    result.append(
+-                        KnowledgeBaseInfo(
+-                            id=resource.id,
+-                            name=resource.name,
+-                            is_default=False,
+-                            statistics={},
+-                            metadata={},
+-                            status="unknown",
+-                            source="admin",
+-                            assigned=True,
+-                            read_only=True,
+-                            provenance_label=str(access.get("provenance_label") or ""),
+-                        )
+-                    )
++            assigned = await loop.run_in_executor(
++                None, _load_assigned_kbs_sync, access_items, own_ids, is_admin
++            )
++            result.extend(assigned)
+         return result
+     except HTTPException:
+         raise
+diff --git a/deeptutor/knowledge/manager.py b/deeptutor/knowledge/manager.py
+index 31218eb..724bdb8 100644
+--- a/deeptutor/knowledge/manager.py
++++ b/deeptutor/knowledge/manager.py
+@@ -15,6 +15,7 @@ from pathlib import Path
+ import shutil
+ import stat
+ import sys
++import time
+ from typing import Any
+ 
+ from deeptutor.services.rag.factory import DEFAULT_PROVIDER, normalize_provider_name
+@@ -202,6 +203,7 @@ class KnowledgeBaseManager:
+ 
+         # Config file to track knowledge bases
+         self.config_file = self.base_dir / "kb_config.json"
++        self._config_cache: tuple[float, dict] | None = None
+         self.config = self._load_config()
+ 
+         # PocketBase sync — enabled when integrations.pocketbase_url is set.
+@@ -212,7 +214,16 @@ class KnowledgeBaseManager:
+         self._pb_enabled = is_pocketbase_enabled()
+ 
+     def _load_config(self) -> dict:
+-        """Load knowledge base configuration from the canonical kb_config.json file."""
++        """Load knowledge base configuration from the canonical kb_config.json file.
++
++        The result is cached for 2 seconds to avoid redundant disk I/O and
++        expensive normalization (list_kb_versions scans every KB directory)
++        when get_info() is called repeatedly.
++        """
++        now = time.monotonic()
++        if self._config_cache is not None and (now - self._config_cache[0]) < 2.0:
++            return self._config_cache[1]
++
+         if self.config_file.exists():
+             try:
+                 with open(self.config_file, encoding="utf-8") as f:
+@@ -283,6 +294,7 @@ class KnowledgeBaseManager:
+                     except Exception as save_err:
+                         logger.warning(f"Failed to persist normalized KB config: {save_err}")
+ 
++                self._config_cache = (now, config)
+                 return config
+             except (json.JSONDecodeError, Exception) as e:
+                 logger.warning(f"Error loading config: {e}")
+@@ -291,6 +303,8 @@ class KnowledgeBaseManager:
+ 
+     def _save_config(self):
+         """Save knowledge base configuration (thread-safe with file locking)"""
++        # Invalidate cache since config is being modified
++        self._config_cache = None
+         # Use exclusive lock for writing
+         with open(self.config_file, "w", encoding="utf-8") as f:
+             with file_lock_exclusive(f):

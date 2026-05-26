@@ -35,6 +35,50 @@ class UnifiedLocalProvider:
             self._chroma_dir,
         )
 
+    async def add_documents(
+        self,
+        kb_name: str,
+        documents: list[str],
+        metadatas: list[dict] | None = None,
+        ids: list[str] | None = None,
+    ) -> dict:
+        """Batch-add chunked documents to the knowledge base."""
+        if not documents:
+            return {"ok": True, "count": 0}
+        try:
+            import chromadb
+            from chromadb.config import Settings
+
+            os.makedirs(self._chroma_dir, exist_ok=True)
+            client = chromadb.PersistentClient(
+                path=self._chroma_dir,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            collection = client.get_or_create_collection(name=kb_name)
+
+            embeddings: list[list[float]] = []
+            for doc in documents:
+                emb_resp = await self._client.post(
+                    f"{self._ollama_url}/api/embeddings",
+                    json={"model": "nomic-embed-text", "prompt": doc[:512]},
+                )
+                if emb_resp.status_code == 200:
+                    emb_data = emb_resp.json()
+                    embeddings.append(emb_data.get("embedding", []))
+                else:
+                    embeddings.append([])
+
+            collection.add(
+                embeddings=embeddings,
+                documents=documents,
+                ids=ids or [f"chunk_{i}" for i in range(len(documents))],
+                metadatas=metadatas,
+            )
+            return {"ok": True, "count": len(documents)}
+        except Exception as e:
+            logger.warning("add_documents failed (non-fatal): %s", e)
+            return {"ok": False, "error": str(e)}
+
     async def ingest_text(
         self,
         content: str,
@@ -109,9 +153,11 @@ class UnifiedLocalProvider:
                 n_results=n_results,
             )
             docs = []
+            distances_list = results.get("distances", [[]])[0] or []
             for i, doc in enumerate(results.get("documents", [[]])[0]):
                 meta = (results.get("metadatas", [[]])[0] or {}) if results.get("metadatas") else {}
-                docs.append({"content": doc, "metadata": meta})
+                dist = float(distances_list[i]) if i < len(distances_list) else 1.0
+                docs.append({"content": doc, "metadata": meta, "distance": dist})
             return docs
         except Exception as e:
             logger.warning("Vector query failed (non-fatal): %s", e)

@@ -3129,6 +3129,7 @@ _TEACHER_SOUL = """# Soul
 ### [PHASE:FIRST_QUESTION] — 首次出题
 
 你的角色：只展示一道题目，用一个引导问题引发思考。
+**引导问题的目的是激发解题思路，不是暗示答案。**
 
 格式：
 ```
@@ -3138,7 +3139,7 @@ _TEACHER_SOUL = """# Soul
 
 [ANSWER_KEY:X]  [KP_ID:学科/章/节]
 
-一个引导性问题？
+引导问题
 ```
 
 规则：
@@ -3148,6 +3149,25 @@ _TEACHER_SOUL = """# Soul
 - ❌ 禁止任何答案提示、分析、概念讲解、选项比较
 - ❌ 禁止"答对了/答错了"等判断
 - ❌ 禁止无意义反问（"这个对吗？""你觉得呢？"）
+
+**引导问题规范：**
+
+引导问题必须满足以下条件：
+- ✅ 问解题思路、概念理解、方法选择 — 而不是问答案数字或选项
+- ✅ 帮助学生回忆相关知识点或解题策略
+- ❌ 禁止直接问答案（如"X等于多少？""选哪个？""结果是多少？"）
+- ❌ 禁止把问题重述一遍然后问答案
+
+好的引导问题示例：
+- "想想看，全面调查需要逐一统计每个个体。哪个选项涉及的数量最大、逐一调查最不现实？"
+- "分式的定义还记得吗？分母不能为什么数？"
+- "这道题涉及哪个知识点？可以先回顾一下相关的公式。"
+
+坏的引导问题（禁止）：
+- "x等于多少呢？" → 直接问答案
+- "这道题选哪个选项？" → 直接问答案
+- "计算结果是几？" → 直接问答案
+- "1+1=？" → 只是重复题目
 
 ---
 
@@ -3310,23 +3330,21 @@ async def _build_teaching_persona(
 
     # Inject relevant knowledge from KB to supplement teaching.
     # Query ChromaDB for content related to the exam topic, excluding the
-    # exam itself (skip results that overlap heavily with the current context).
+    # exam itself (skip results with high semantic similarity to context).
     try:
         provider = get_provider_instance()
         _kb_results = provider.query("tutoring", [_exam], n_results=5)
-        _kb_docs = _kb_results.get("documents", [[]])[0] if _kb_results else []
         _kb_found = []
         if _exam:
-            _exam_normalized = _exam.replace(" ", "").replace("\n", "")[:200]
-            for _doc in _kb_docs:
-                _dc = _doc.strip()[:200]
+            for _doc_item in _kb_results:
+                _dc = _doc_item.get("content", "").strip()[:200]
+                _dist = _doc_item.get("distance", 1.0)
                 if not _dc:
                     continue
-                _doc_normalized = _dc.replace(" ", "").replace("\n", "")
-                # Skip if KB result is essentially the same as current exam
-                _overlap = len(set(_exam_normalized) & set(_doc_normalized))
-                _min_len = min(len(_exam_normalized), len(_doc_normalized)) or 1
-                if _overlap / _min_len > 0.6:
+                # Skip near-duplicates: distance < 0.6 means high semantic
+                # similarity to the current exam (ChromaDB L2, lower = more
+                # similar).  Prevents injecting exam content-with-answers.
+                if _dist < 0.6:
                     continue
                 _kb_found.append(_dc)
                 if len(_kb_found) >= 3:
@@ -3369,7 +3387,10 @@ async def _build_teaching_persona(
                 _lines.append(f"- {_name}（正确率 {_pct}%，已答 {w['total']} 题）")
             _persona += "\n" + "\n".join(_lines) + "\n"
 
-            # Add recent wrong answers for specific context
+            # Add recent wrong answers for specific context.
+            # NOTE: correct_answer is omitted when the wrong answer question
+            # appears in the current exam context, preventing DT from seeing
+            # the answer key during new-question guidance.
             _wrongs = await asyncio.to_thread(get_wrong_answers, learner_id, limit=3)
             if _wrongs:
                 _persona += "\n### 近期错题记录\n以下题目学生最近答错，教学时注意关联：\n"
@@ -3379,7 +3400,19 @@ async def _build_teaching_persona(
                     _sa = w.get("student_answer", "")
                     _ca = w.get("correct_answer", "")
                     if _q:
-                        _persona += f"- {_q}（知识点：{_kp}，学生回答：{_sa}，正确答案：{_ca}）\n"
+                        # If wrong-answer question text appears in the current
+                        # exam context, omit the correct answer — DT would
+                        # otherwise see the answer key for a live paper question.
+                        _omit_ca = (
+                            bool(_exam)
+                            and len(_q) > 5
+                            and _q.replace(" ", "").replace("\n", "")
+                            in _exam.replace(" ", "").replace("\n", "")
+                        )
+                        if _omit_ca:
+                            _persona += f"- {_q}（知识点：{_kp}，学生回答：{_sa}）\n"
+                        else:
+                            _persona += f"- {_q}（知识点：{_kp}，学生回答：{_sa}，正确答案：{_ca}）\n"
     except Exception:
         logger.debug("Weak points lookup failed for %s, continuing", learner_id)
 
@@ -4039,7 +4072,9 @@ async def _tutor_chat_core(
             "🔴 本次回复只能出一道题！从试卷中选编号最小的未做题输出。\n"
             "🔴 绝对禁止在一条回复中出现两道或以上的题目。\n"
             "🔴 即使两道题紧邻，也必须分两次输出。\n"
-            "✅ 只输出题目 + 一个引导问题，禁止答案提示。\n"
+            "✅ 只输出题目 + 一个引导问题。\n"
+            "🔴 引导问题严禁直接问答案（如\"x等于多少？\"\"选哪个？\"\"结果是？\"）。\n"
+            "✅ 引导问题应指向解题思路或概念理解，而非答案本身。\n"
         )
         payload = f"[PHASE:{_phase}]{_constraint}\n{context}"
     else:
@@ -4050,6 +4085,8 @@ async def _tutor_chat_core(
             "🔴 绝对禁止在一条回复中出现两道或以上的题目。\n"
             "🔴 不要提前展示第N+2题。\n"
             "✅ 只输出一道题 + 讲解 + 一个引导问题。\n"
+            "🔴 引导问题严禁直接问答案（如\"x等于多少？\"\"选哪个？\"\"结果是？\"）。\n"
+            "✅ 引导问题应指向解题思路或概念理解，而非答案本身。\n"
         )
         payload = f"[PHASE:{_phase}]{_constraint}\n" + (message or context or "")
         # Attach exam context so the LLM picks the next question from the
