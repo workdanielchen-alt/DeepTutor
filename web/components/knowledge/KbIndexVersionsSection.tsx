@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   AlertTriangle,
@@ -39,11 +39,19 @@ export default function KbIndexVersionsSection({
 }: KbIndexVersionsSectionProps) {
   const { t } = useTranslation();
   const [submitting, setSubmitting] = useState(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   const versions = kb.statistics?.index_versions ?? [];
   const activeSig = kb.statistics?.active_signature ?? null;
   const needsReindex = kbNeedsReindex(kb);
   const mismatch = Boolean(kb.metadata?.embedding_mismatch);
-  const isReindexingHere = task?.kind === "reindex" && task.executing;
+  const isReindexingHere = task?.kind === "reindex" && task?.executing;
+  const isSpinning = submitting || isReindexingHere;
   const percent = resolveProgressPercent(kb.progress);
   const lastIndexed = formatKnowledgeTimestamp(kb.metadata?.last_indexed_at);
   const lastIndexedCount = kb.metadata?.last_indexed_count;
@@ -53,7 +61,7 @@ export default function KbIndexVersionsSection({
     try {
       await onReindex();
     } finally {
-      setSubmitting(false);
+      if (mountedRef.current) setSubmitting(false);
     }
   };
 
@@ -89,11 +97,18 @@ export default function KbIndexVersionsSection({
             )}
             className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1 text-[12px] font-medium text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300"
           >
-            {submitting || isReindexingHere ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3 w-3" />
-            )}
+            <span className="grid *:[grid-area:1/1]">
+              <Loader2
+                className={`h-3 w-3 animate-spin transition-opacity ${
+                  isSpinning ? "opacity-100" : "opacity-0"
+                }`}
+              />
+              <RefreshCw
+                className={`h-3 w-3 transition-opacity ${
+                  isSpinning ? "opacity-0" : "opacity-100"
+                }`}
+              />
+            </span>
             {isReindexingHere ? t("Re-indexing…") : t("Re-index")}
           </button>
         )}
@@ -150,26 +165,24 @@ export default function KbIndexVersionsSection({
         </div>
       )}
 
-      {task?.kind === "reindex" &&
-        (task.taskId || task.logs.length > 0 || task.executing) && (
-          <div className="space-y-2">
+      <div className={`space-y-2 ${task?.kind === "reindex" && (task?.taskId || task?.logs.length > 0 || task?.executing) ? "" : "hidden"}`}>
             <div className="flex items-center justify-between text-[11px] text-[var(--muted-foreground)]">
               <span>
-                {task.label}
-                {task.taskId ? ` · ${task.taskId}` : ""}
+                {task?.label}
+                {task?.taskId ? ` · ${task?.taskId}` : ""}
               </span>
-              {task.executing && percent > 0 && (
+              {task?.executing && percent > 0 && (
                 <span className="font-medium text-[var(--foreground)]">
                   {percent}%
                 </span>
               )}
             </div>
             <ProcessLogs
-              logs={task.logs}
-              executing={task.executing}
+              logs={task?.logs ?? []}
+              executing={task?.executing ?? false}
               title={t("Re-index Process")}
             />
-            {task.executing && (
+            {task?.executing && (
               <div className="h-1.5 overflow-hidden rounded-full bg-[var(--border)]/70">
                 <div
                   className="h-full rounded-full bg-[var(--primary)] transition-all duration-300"
@@ -177,15 +190,14 @@ export default function KbIndexVersionsSection({
                 />
               </div>
             )}
-            {task.error && (
+            {task?.error && (
               <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
                 <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed">
-                  {task.error}
+                  {task?.error}
                 </pre>
               </div>
             )}
           </div>
-        )}
     </div>
   );
 }

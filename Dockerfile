@@ -149,8 +149,8 @@ COPY --from=python-base /usr/local/bin /usr/local/bin
 # Copy built frontend from frontend-builder stage (standalone mode)
 # The standalone output contains a self-contained server.js + minimal node_modules
 # Static assets and public/ must be copied alongside standalone manually
-COPY --from=frontend-builder /app/web/.next/standalone/ ./web/
-COPY --from=frontend-builder /app/web/.next/static/ ./web/.next/static/
+COPY --from=frontend-builder /app/web/.next2/standalone/ ./web/
+COPY --from=frontend-builder /app/web/.next2/static/ ./web/.next2/static/
 COPY --from=frontend-builder /app/web/public/ ./web/public/
 
 # Copy application source code

@@ -46,6 +46,17 @@ export function useKnowledgeBases() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Guard: ignore async state updates after the component unmounts.
+  // Without this, in-flight load() calls that resolve after page navigation
+  // trigger setState on a stale fiber tree, causing React 19 concurrent-mode
+  // insertBefore crashes from interleaved reconciliation.
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
+
   const refreshRef = useRef<(opts?: LoadOptions) => Promise<void>>(
     async () => {},
   );
@@ -86,6 +97,7 @@ export function useKnowledgeBases() {
             () => DEFAULT_UPLOAD_POLICY,
           ),
         ]);
+        if (!aliveRef.current) return;
         const typedKbs = kbList as KnowledgeBase[];
         setKbs(typedKbs);
         setUploadPolicy(policy);
@@ -111,9 +123,10 @@ export function useKnowledgeBases() {
           }
         }
       } catch (err) {
+        if (!aliveRef.current) return;
         setError(err instanceof Error ? err.message : String(err));
       } finally {
-        if (showSpinner) setLoading(false);
+        if (aliveRef.current && showSpinner) setLoading(false);
       }
     },
     [progress],

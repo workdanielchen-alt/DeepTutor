@@ -46,6 +46,18 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
 
   const socketsRef = useRef<Record<string, WebSocket>>({});
   const sourcesRef = useRef<Record<string, EventSource>>({});
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    return () => {
+      aliveRef.current = false;
+      // Tear down live connections eagerly so no stale callbacks fire during
+      // the React 19 concurrent-mode unmount window.
+      Object.values(socketsRef.current).forEach((s) => s.close());
+      socketsRef.current = {};
+      Object.values(sourcesRef.current).forEach((s) => s.close());
+      sourcesRef.current = {};
+    };
+  }, []);
 
   const closeSocket = useCallback((kbName: string) => {
     socketsRef.current[kbName]?.close();
@@ -91,6 +103,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       socketsRef.current[kbName] = socket;
 
       socket.onmessage = (event) => {
+        if (!aliveRef.current) return;
         try {
           const raw = JSON.parse(event.data) as {
             type?: string;
@@ -150,6 +163,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       let settled = false;
 
       source.addEventListener("process_log", (event) => {
+        if (!aliveRef.current) return;
         try {
           const payload = JSON.parse((event as MessageEvent).data) as {
             message?: string;
@@ -172,6 +186,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       });
 
       source.addEventListener("progress", (event) => {
+        if (!aliveRef.current) return;
         try {
           const payload = JSON.parse(
             (event as MessageEvent).data,
@@ -183,6 +198,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       });
 
       source.addEventListener("complete", () => {
+        if (!aliveRef.current) return;
         settled = true;
         setTasksByKb((prev) => {
           const current = prev[kbName];
@@ -208,6 +224,7 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
       });
 
       source.addEventListener("failed", (event) => {
+        if (!aliveRef.current) return;
         settled = true;
         let detail = "Task failed";
         let details: string | undefined;

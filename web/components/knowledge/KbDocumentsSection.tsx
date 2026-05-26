@@ -67,7 +67,7 @@ export default function KbDocumentsSection({
     : null;
 
   const selection = validateFiles(files, uploadPolicy, t);
-  const isUploadingHere = task?.kind === "upload" && task.executing;
+  const isUploadingHere = task?.kind === "upload" && task?.executing === true;
   const canSubmit =
     uploadable &&
     selection.validFiles.length > 0 &&
@@ -121,39 +121,36 @@ export default function KbDocumentsSection({
           disabled={!canSubmit}
           className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-3.5 py-1.5 text-[13px] font-medium text-[var(--primary-foreground)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          {submitting || isUploadingHere ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Upload size={14} />
-          )}
+          <span className="grid *:[grid-area:1/1]">
+            <Loader2 className={`h-3.5 w-3.5 animate-spin transition-opacity ${submitting || isUploadingHere ? "opacity-100" : "opacity-0"}`} />
+            <Upload className={`h-3.5 w-3.5 transition-opacity ${submitting || isUploadingHere ? "opacity-0" : "opacity-100"}`} />
+          </span>
           {t("Upload")}
         </button>
       </div>
 
-      {(task?.kind === "upload" || task?.kind === "create") &&
-        (task.taskId || task.logs.length > 0 || task.executing) && (
-          <div className="space-y-2">
+      <div className={`space-y-2 ${task?.kind === "upload" || task?.kind === "create" ? "" : "hidden"}`}>
             <div className="flex items-center justify-between text-[11px] text-[var(--muted-foreground)]">
               <span>
-                {task.label}
-                {task.taskId ? ` · ${task.taskId}` : ""}
+                {task?.label}
+                {task?.taskId ? ` · ${task?.taskId}` : ""}
               </span>
-              {task.executing && percent > 0 && (
+              {task?.executing && percent > 0 && (
                 <span className="font-medium text-[var(--foreground)]">
                   {percent}%
                 </span>
               )}
             </div>
             <ProcessLogs
-              logs={task.logs}
-              executing={task.executing}
+              logs={task?.logs ?? []}
+              executing={task?.executing ?? false}
               title={
-                task.kind === "create"
+                task?.kind === "create"
                   ? t("Create Process")
                   : t("Upload Process")
               }
             />
-            {task.executing && (
+            {task?.executing && (
               <div className="h-1.5 overflow-hidden rounded-full bg-[var(--border)]/70">
                 <div
                   className="h-full rounded-full bg-[var(--primary)] transition-all duration-300"
@@ -161,15 +158,14 @@ export default function KbDocumentsSection({
                 />
               </div>
             )}
-            {task.error && (
+            {task?.error && (
               <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
                 <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed">
-                  {task.error}
+                  {task?.error}
                 </pre>
               </div>
             )}
           </div>
-        )}
 
       <KbUpdateHistory entries={history} onClear={onClearHistory} />
     </div>
