@@ -1467,6 +1467,11 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.warning("[%s] DIAG: media_paths=%d auto_proc=%s → trigger auto_process_media",
                            self.name, len(media_paths), sender_id not in self._auto_processing_senders)
             self._auto_processing_senders.add(sender_id)
+            # 发确认消息，让用户知道正在处理
+            try:
+                await self.send(content="📝 收到题目，正在识别处理，请稍候...", chat_id=effective_chat_id)
+            except Exception:
+                pass
             try:
                 event = await self._auto_process_media(event, sender_id)
             except Exception as exc:
@@ -1487,8 +1492,10 @@ class WeixinAdapter(BasePlatformAdapter):
                             self.name, _safe_id(sender_id), len(_tutor_reply))
                 return  # Skip handle_message — already delivered
             else:
-                logger.warning("[%s] DIAG: auto-proc finished, _tutor_reply empty, falling through to agent for %s",
+                logger.warning("[%s] DIAG: auto-proc finished, _tutor_reply empty (async path), "
+                               "skipping agent for %s",
                                self.name, _safe_id(sender_id))
+                return  # Skip agent — async tutor notification will arrive via bridge
 
         _dt_attempted = False
         if not media_paths and (getattr(event, "text", "") or "").strip():
@@ -1596,8 +1603,25 @@ class WeixinAdapter(BasePlatformAdapter):
 
         platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
 
+        # ==== Acquire LLM lock before OCR (architecture: 60s timeout, TTL 120s) ====
+        _lock_held = False
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=70)) as _lock_session:
+                async with _lock_session.post(
+                    f"{platform_url}/api/llm/acquire",
+                    params={"timeout": "60"},
+                ) as _lock_resp:
+                    if _lock_resp.status == 200:
+                        _lock_held = True
+                        logger.warning("[%s] LLM lock acquired for OCR", self.name)
+                    else:
+                        logger.warning("[%s] LLM lock busy, proceeding without lock", self.name)
+        except Exception as _lock_exc:
+            logger.warning("[%s] LLM lock acquire failed: %s, proceeding", self.name, _lock_exc)
+
+        try:
+            _upload_timeout = int(os.getenv("PLATFORM_UPLOAD_TIMEOUT", "120"))
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_upload_timeout)) as session:
                 with open(file_path, "rb") as f:
                     data = aiohttp.FormData()
                     data.add_field("file", f, filename=os.path.basename(file_path),
@@ -1613,6 +1637,13 @@ class WeixinAdapter(BasePlatformAdapter):
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning("[%s] DIAG: auto-proc bailed — connection error: %s", self.name, e)
             return event
+        finally:
+            if _lock_held:
+                try:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as _rel_session:
+                        await _rel_session.post(f"{platform_url}/api/llm/release")
+                except Exception:
+                    pass
 
         if not result.get("ok"):
             logger.warning("[%s] DIAG: auto-proc bailed — platform !ok: %s",
@@ -1620,6 +1651,14 @@ class WeixinAdapter(BasePlatformAdapter):
             return event
 
         ocr_text = result.get("content", "").strip()
+        _route = result.get("route", "")
+        # OCR 成功 → 立即创建教学会话，不等通知桥。用户回复文字直接走 DT 而非 LLM agent
+        if _route != "ocr_fallback" and ocr_text:
+            self._teaching_sessions[sender_id] = time.time()
+            self._save_teaching_sessions()
+            logger.warning("[%s] DIAG: Teaching session created for %s (async tutor pending)",
+                           self.name, _safe_id(sender_id))
+
         tutor_content = result.get("tutor_content", "").strip()
         logger.warning("[%s] DIAG: auto-proc result ocr=%d tutor=%d",
                        self.name, len(ocr_text), len(tutor_content))
@@ -1627,16 +1666,15 @@ class WeixinAdapter(BasePlatformAdapter):
 
         if ocr_text:
             if tutor_content:
-                # DT Bot 成功: OCR 内容注入事件供 agent 参考
-                extra_parts.append(f"[试卷内容]\n{ocr_text[:500]}")
+                # OCR 内容注入事件供 agent 参考
+                extra_parts.append(ocr_text[:500])
             else:
-                # DT Bot 失败: 不暴露考题原文给 agent, 防止 LLM 绕过 DT 直接答题
-                extra_parts.append("[图片已自动识别，如需学习帮助请直接发消息提问]")
-                logger.warning("[%s] DIAG: auto-proc DT Bot silent, suppress exam content from agent msg",
+                # DT Bot 异步处理中，不暴露考题原文给 agent，不做额外提示
+                logger.warning("[%s] DIAG: auto-proc DT Bot silent (async), suppress exam content from agent msg",
                                self.name)
 
         if tutor_content:
-            extra_parts.append(f"[引导式教学]\n{tutor_content}")
+            extra_parts.append(tutor_content)
             self._last_tutor_reply[sender_id] = tutor_content  # per-sender
             logger.warning("[%s] DIAG: auto-proc setting _last_tutor_reply[%s] len=%d",
                            self.name, sender_id, len(tutor_content))
@@ -1723,21 +1761,6 @@ class WeixinAdapter(BasePlatformAdapter):
                         return ""
                     result = await resp.json()
                     if result.get("ok"):
-                        # Send practice questions if generated
-                        pending = result.get("pending_practice", [])
-                        if pending:
-                            practice_lines = [
-                                "📝 巩固练习（针对你的薄弱点）",
-                                "─" * 20,
-                            ]
-                            for i, q in enumerate(pending[:5], 1):
-                                practice_lines.append(f"{i}. {q.get('question', '')}")
-                                opts = q.get("options", {})
-                                for k, v in opts.items():
-                                    practice_lines.append(f"   {k}. {v}")
-                                practice_lines.append("")
-                            practice_text = "\n".join(practice_lines)
-                            await self.send(content=practice_text, chat_id=sender_id)
                         return result.get("content", "")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.debug("[%s] Teaching follow-up failed: %s", self.name, e)
@@ -2008,9 +2031,17 @@ class WeixinAdapter(BasePlatformAdapter):
 
     async def _consume_report_notifications(self) -> None:
         """Background task: poll /data/hermes/notifications/ for report_push
-        notifications and send them to the learner via WeChat."""
+        notifications and send them to the appropriate WeChat user.
+
+        Routes by target field:
+          - target="parent" → sent by parent gateway (管理员)
+          - target="child"  → sent by child gateway (学生)
+        """
         notif_dir = Path("/data/hermes/notifications")
-        logger.info("[%s] Report notification consumer started", self.name)
+        # Determine which target this gateway handles
+        _is_child = os.environ.get("HERMES_HOME", "").endswith("/child")
+        _my_target = "child" if _is_child else "parent"
+        logger.info("[%s] Report notification consumer started (target=%s)", self.name, _my_target)
         while self._running:
             try:
                 if notif_dir.exists():
@@ -2020,15 +2051,37 @@ class WeixinAdapter(BasePlatformAdapter):
                         try:
                             with open(f, encoding="utf-8") as fh:
                                 notif = json.load(fh)
+
+                            # ── Async tutor reply (from background tutor_chat) ──
+                            if notif.get("type") == "tutor_reply":
+                                _lid = notif.get("learner_id", "")
+                                _ct = notif.get("content", "")
+                                if _lid and _ct:
+                                    await self.send(content=_ct, chat_id=_lid)
+                                    # 创建教学会话，确保用户后续回复走 DeepTutor 而非 LLM agent
+                                    self._teaching_sessions[_lid] = time.time()
+                                    self._save_teaching_sessions()
+                                    logger.info(
+                                        "[%s] Async tutor reply sent to %s (%d chars)",
+                                        self.name, _lid, len(_ct),
+                                    )
+                                consumed = f.with_suffix(".consumed")
+                                f.rename(consumed)
+                                continue
+
                             if notif.get("type") != "report_push":
+                                continue
+                            # Route by target: skip if not for this gateway
+                            _notif_target = notif.get("target", "parent")  # default parent for backward compat
+                            if _notif_target != _my_target:
                                 continue
                             learner_id = notif.get("learner_id", "")
                             content = notif.get("content", "")
                             if learner_id and content:
                                 await self.send(content=content, chat_id=learner_id)
                                 logger.info(
-                                    "[%s] Report pushed to %s: %s",
-                                    self.name, learner_id, notif.get("report_type", "?")
+                                    "[%s] Report pushed to %s: %s (target=%s)",
+                                    self.name, learner_id, notif.get("report_type", "?"), _notif_target
                                 )
                             # Mark as consumed
                             consumed = f.with_suffix(".consumed")

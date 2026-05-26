@@ -323,7 +323,7 @@ vendor/
 
 # Next.js build artifacts (dev copies)
 web/.next-new/
-web/.next.old/
+web/.next.old
 web/.next2/
 
 # One-off debug / test files

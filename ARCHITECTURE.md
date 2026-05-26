@@ -184,14 +184,15 @@
 
 #### LLM 资源锁
 
-`_llm_lock` (`asyncio.Lock`) 序列化本地 NPU 访问：
+`_llm_lock` (`_TTLock`, TTL=120s) 序列化本地 NPU 访问，带超时自动恢复机制：
+当锁持有超过 TTL（如 HTTP release 请求丢失），`api_llm_acquire` 自动检测 stale 状态并 force_release，防止死锁：
 
 | 场景 | 超时 | 结果 |
 |------|------|------|
 | DT 教学，锁空闲 | 5s | 获取 → 切 DT 到 rkllama 配置 → 本地 NPU 教学 |
 | DT 教学，锁被占 | 5s 超时 | 切 DT 到 deepseek 配置 → 云端 API 教学 |
-| HA OCR，锁空闲 | 300s | 获取 → OCR → 释放 |
-| HA OCR，锁被占 | 300s | 等待 (DT 教学通常 30-60s 完成) |
+| HA OCR，锁空闲 | 60s | 获取 → OCR → 释放 |
+| HA OCR，锁被占 | 60s | 等待 (DT 教学通常 30-60s 完成) |
 
 #### MCP Server (同进程 ASGI 合并)
 
@@ -375,29 +376,41 @@ NPU LLM 服务，运行在 RK3576 NPU 上。
                   │
                   ├─ _auto_process_media()
                   │    │
-                  │    ├─ POST /api/llm/acquire?timeout=300s
+                  │    ├─ POST /api/llm/acquire?timeout=60s
                   │    │    ├─ 成功 → 持有锁做 OCR
                   │    │    └─ 失败 → OCR 跳过 (罕见)
                   │    │
-                  │    ├─ POST /api/process/file
+                  │    ├─ POST /api/process/file (auto_teach=true)
                   │    │    │
-                  │    │    ├─ OpenCV 预处理 → rkllama OCR
-                  │    │    │    └─ OCR 结果:
-                  │    │    │        ├─ 有内容 → 入库知识库
-                  │    │    │        └─ 空/失败 → 引导用户重新输入
+                  │    │    ├─ OpenCV 预处理 → OCR
+                  │    │    │    ├─ rkllama (生产 RK3576 NPU)
+                  │    │    │    └─ Ollama MiniCPM-V (开发/PC 兜底)
                   │    │    │
-                  │    │    └─ auto_teach=true 且内容为教育 → _tutor_chat_core()
-                  │    │         │
-                  │    │         ├─ _llm_lock.acquire(timeout=5s)
-                  │    │         │    ├─ 成功 → 切 DT 到 rkllama
-                  │    │         │    └─ 超时 → 切 DT 到 deepseek
-                  │    │         │
-                  │    │         └─ DT WebSocket 教学
-                  │    │              └─ DT AgentLoop → LLM (本地/云端)
+                  │    │    ├─ OCR 结果检查
+                  │    │    │    ├─ 有内容 → 入库 + 缓存上下文
+                  │    │    │    └─ 空/乱码 → route=ocr_fallback
+                  │    │    │
+                  │    │    └─ auto_teach_effective (教育内容 + 非 ocr_fallback)
+                  │    │         └─ asyncio.create_task(_async_tutor_teach)
+                  │    │              │  ← 异步后台，不阻塞 OCR 返回
+                  │    │              │
+                  │    │              ├─ _llm_lock.acquire(timeout=5s)
+                  │    │              │    ├─ 成功 → 直连 rkllama API (绕 DT WS)
+                  │    │              │    └─ 超时 → DT WebSocket → DeepSeek 云端
+                  │    │              │
+                  │    │              └─ _write_tutor_notification()
+                  │    │                   ← tutor_reply JSON 写入通知目录
                   │    │
-                  │    └─ 教学会话创建
+                  │    └─ 释放 LLM 锁 (POST /api/llm/release)
                   │
-                  └─ 通知文件写入 → HA 消费后推送微信
+                  ├─ 即时确认: "📝 收到题目，正在识别处理，请稍候..."
+                  │
+                  └─ 后台 30s 轮询: _consume_report_notifications()
+                       │
+                       └─ tutor_reply 文件
+                            ├─ self.send() → 微信用户
+                            ├─ 创建 teaching_session (后续文本走 DT)
+                            └─ 重命名 .consumed
 
 微信文字 ──→ hermes_agent
                   │
@@ -486,7 +499,7 @@ SOUL.md 注入 (每次教学前):
     │    │
     │    ├─ 图片 (.jpg/.png/…)
     │    │    └─ OpenCV 预处理 (去偏斜 → 去噪 → CLAHE 增强 → 自适应二值化)
-    │    │         └─ rkllama OCR → 文本
+    │    │         └─ OCR (rkllama NPU / Ollama MiniCPM-V 兜底) → 文本
     │    │
     │    ├─ PDF
     │    │    ├─ 含文本层 → markitdown 提取

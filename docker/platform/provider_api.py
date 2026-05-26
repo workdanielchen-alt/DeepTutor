@@ -12,6 +12,7 @@ import atexit
 import base64
 from datetime import datetime, timedelta, timezone
 import glob
+import html
 import json
 import logging
 import os
@@ -304,9 +305,50 @@ async def _dt_session_cleanup_loop():
 _soul_global_lock = asyncio.Lock()
 _soul_version: int = 0  # 每次 SOUL.md 更新递增, 用于检测过期写入
 
+class _TTLock:
+    """Asyncio lock with TTL safety valve.
+
+    The lock is acquired/released via HTTP (OCR pipeline from WeChat gateway),
+    so a network failure during release can leave the lock permanently stuck.
+    This wrapper detects stale holds and auto-recovers.
+    """
+
+    def __init__(self, ttl: float = 120.0):
+        self._lock = asyncio.Lock()
+        self._ttl = ttl
+        self._acquired_at: float | None = None
+
+    async def acquire(self):
+        await self._lock.acquire()
+        self._acquired_at = time.time()
+
+    def release(self):
+        self._acquired_at = None
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def is_stale(self) -> bool:
+        if self._acquired_at is None:
+            return False
+        if not self._lock.locked():
+            self._acquired_at = None  # already released elsewhere
+            return False
+        return time.time() - self._acquired_at > self._ttl
+
+    def force_release(self):
+        self._acquired_at = None
+        try:
+            self._lock.release()
+        except RuntimeError:
+            pass
+
+
 # Local LLM resource lock: provider 统一调度本地 LLM (rkllama) 访问.
 # HA 的 OCR 通过 HTTP acquire/release 申请锁; DT 后续如需本地 LLM 也通过此锁.
-_llm_lock = asyncio.Lock()
+# TTL 120s — HTTP release 可能因网络故障静默失败, TTL 兜底自动恢复.
+_llm_lock = _TTLock(ttl=120)
 
 # OCR 并发控制: 最多 2 个并发 OCR 请求, 防止 NPU OOM.
 _ocr_semaphore = asyncio.Semaphore(2)
@@ -1057,11 +1099,6 @@ async def _handle_inbound_file(
                 if ocr_text:
                     content += ocr_text
 
-                # LibreOffice conversion for old .doc/.ppt (equations, embedded objects)
-                lo_text = await _ocr_old_doc_with_libreoffice(file_path, trace_id)
-                if lo_text:
-                    content += "\n\n" + lo_text
-
             if content:
                 return _cache_res(
                     {
@@ -1072,20 +1109,6 @@ async def _handle_inbound_file(
                         "storage": {"ok": False},
                     }
                 )
-
-            # Last resort: LibreOffice for old .doc/.ppt with equations
-            if ext in {".doc", ".ppt", ".pps"}:
-                lo_text = await _ocr_old_doc_with_libreoffice(file_path, trace_id)
-                if lo_text:
-                    return _cache_res(
-                        {
-                            "ok": True,
-                            "content": lo_text,
-                            "intent": "EDUCATION",
-                            "route": "document_extract",
-                            "storage": {"ok": False},
-                        }
-                    )
 
             logger.warning("[%s] all extractors failed for %s", trace_id, file_path)
             return _cache_res(_fallback_placeholder(file_path, ext))
@@ -1185,7 +1208,7 @@ async def _handle_pdf(file_path: str, trace_id: str) -> str:
 
 
 def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
-    """Preprocess image for OCR: deskew → denoise → enhance → threshold."""
+    """Preprocess image for OCR: downscale → grayscale → denoise → enhance → threshold."""
     try:
         import cv2
         import numpy as np
@@ -1198,15 +1221,27 @@ def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
         return image_bytes  # can't decode, return raw
 
     try:
+        # Downscale: cap longest side at 1200px (OCR quality plateaus well before this,
+        # but preprocessing and inference cost scale with pixel count).
+        _MAX_DIM = 1200
+        h, w = img.shape[:2]
+        if max(h, w) > _MAX_DIM:
+            scale = _MAX_DIM / max(h, w)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
         # Grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Denoise
-        denoised = cv2.fastNlMeansDenoising(gray)
-
-        # CLAHE contrast enhancement
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(denoised)
+        # Detect clean/high-contrast image (e.g. phone screenshot): skip denoising.
+        # fastNlMeansDenoising is the most expensive preprocessing step (~40-60% of total
+        # CPU time); screenshots have negligible noise so it buys nothing.
+        _is_clean = gray.std() > 40
+        if _is_clean:
+            enhanced = gray
+        else:
+            denoised = cv2.fastNlMeansDenoising(gray)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(denoised)
 
         # Deskew: detect text angle and rotate
         coords = np.column_stack(np.where(enhanced < 128))  # dark pixels
@@ -1482,95 +1517,6 @@ def _extract_with_catppt(file_path: str) -> str:
         logger.warning("[catppt] Returned %d for %s", result.returncode, file_path)
     except Exception as exc:
         logger.warning("[catppt] Failed for %s: %s", file_path, exc)
-    return ""
-
-
-async def _ocr_old_doc_with_libreoffice(file_path: str, trace_id: str) -> str:
-    """Convert old .doc/.ppt to PDF via LibreOffice, then render→OCR each page.
-
-    Used for image-rich or scanned old-format Office files that antiword/catppt
-    cannot extract meaningful text from.  Handles Equation Editor formulas and
-    embedded images by rendering the full document as page images.
-    """
-    import tempfile
-    import shutil
-
-    output_dir = tempfile.mkdtemp()
-    try:
-        result = subprocess.run(
-            [
-                "libreoffice",
-                "--headless",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                output_dir,
-                file_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            logger.debug(
-                "[%s] LibreOffice convert failed (rc=%d): %s",
-                trace_id,
-                result.returncode,
-                result.stderr[:200],
-            )
-            return ""
-
-        pdf_path = None
-        for f in os.listdir(output_dir):
-            if f.lower().endswith(".pdf"):
-                pdf_path = os.path.join(output_dir, f)
-                break
-
-        if not pdf_path or not os.path.getsize(pdf_path):
-            return ""
-
-        # Render PDF pages → OCR via existing pipeline
-        import fitz
-
-        doc = fitz.open(pdf_path)
-        # Only OCR pages that have embedded raster images (photos, diagrams).
-        # Pure-text pages are already covered by antiword/catppt.
-        image_pages = [i for i, p in enumerate(doc) if p.get_images()]
-        doc.close()
-
-        if not image_pages:
-            return ""
-
-        if not image_pages:
-            logger.debug("[%s] LibreOffice PDF has no image pages, skipping OCR", trace_id)
-            return ""
-
-        pages_text: list[str] = []
-        for i in image_pages:
-            try:
-                img_bytes = _render_pdf_page(pdf_path, i)
-                processed = _opencv_preprocess_image(img_bytes)
-                page_text = await _ocr_image_bytes(processed, trace_id)
-                if page_text and page_text.strip():
-                    pages_text.append(f"--- 第{i + 1}页 ---\n{page_text.strip()}")
-            except Exception as exc:
-                logger.debug("[%s] LibreOffice PDF page %d OCR failed: %s", trace_id, i, exc)
-
-        if pages_text:
-            combined = "\n\n".join(pages_text)
-            logger.info(
-                "[%s] LibreOffice OCR: %d chars from %d pages",
-                trace_id,
-                len(combined),
-                len(pages_text),
-            )
-            return combined
-    except subprocess.TimeoutExpired:
-        logger.warning("[%s] LibreOffice conversion timed out for %s", trace_id, file_path)
-    except Exception as exc:
-        logger.warning("[%s] LibreOffice OCR failed for %s: %s", trace_id, file_path, exc)
-    finally:
-        shutil.rmtree(output_dir, ignore_errors=True)
     return ""
 
 
@@ -1948,6 +1894,7 @@ async def _notify_hermes_agent(
     try:
         notif_dir = Path("/data/hermes/notifications")
         notif_dir.mkdir(parents=True, exist_ok=True)
+        notif_dir.chmod(0o777)
 
         # 快速检查: 如果文件数远超上限, 跳过本次通知 (降级保护)
         try:
@@ -1965,6 +1912,57 @@ async def _notify_hermes_agent(
         logger.info("[notify_ha] notification written: %s", notif_path)
     except Exception as e:
         logger.debug("[notify_ha] notification write failed: %s", e)
+
+
+async def _async_tutor_teach(content: str, learner_id: str, trace_id: str):
+    """Background task: run tutor_chat and push result via notification file.
+
+    Called fire-and-forget from ``api_process_file`` so the OCR response is
+    not blocked by LLM-based teaching generation.
+    """
+    try:
+        tutor_result = await _tutor_chat_core(
+            message="",
+            learner_id=learner_id,
+            context=content,
+            mode="guide",
+            trace_id=trace_id,
+        )
+        if tutor_result.get("ok") and tutor_result.get("content"):
+            _clean_content = html.unescape(tutor_result["content"])
+            _write_tutor_notification(learner_id, _clean_content, trace_id)
+            logger.info("[%s] Async tutor_chat success for %s", trace_id, learner_id)
+        else:
+            logger.warning(
+                "[%s] Async tutor_chat returned no content: %s",
+                trace_id,
+                tutor_result.get("error", "empty response"),
+            )
+    except Exception as e:
+        logger.warning("[%s] Async tutor_chat failed: %s", trace_id, e)
+
+
+def _write_tutor_notification(learner_id: str, content: str, trace_id: str):
+    """Write a ``tutor_reply`` notification for the hermes-agent to pick up."""
+    notif = {
+        "type": "tutor_reply",
+        "learner_id": learner_id,
+        "content": content,
+        "trace_id": trace_id or "",
+    }
+    notif_dir = Path("/data/hermes/notifications")
+    notif_dir.mkdir(parents=True, exist_ok=True)
+    notif_dir.chmod(0o777)
+    name = f"tutor_{trace_id or int(time.time())}.json"
+    tmp = notif_dir / (name + ".tmp")
+    dst = notif_dir / name
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(notif, f, ensure_ascii=False)
+        os.replace(tmp, dst)
+        logger.info("[notify_tutor] tutor_reply written for %s (%d chars)", learner_id, len(content))
+    except Exception as e:
+        logger.warning("[notify_tutor] failed: %s", e)
 
 
 class QuizSyncRequest(BaseModel):
@@ -2964,27 +2962,15 @@ async def api_process_file(request: Request):
     )
 
     if _auto_teach_effective:
-        content = _ocr_content
-        if content:
-            try:
-                tutor_result = await _tutor_chat_core(
-                    message="",
-                    learner_id=learner_id,
-                    context=content,
-                    mode="guide",
-                    trace_id=trace_id,
-                )
-                if tutor_result.get("ok") and tutor_result.get("content"):
-                    result["tutor_content"] = tutor_result["content"]
-                    logger.info("[%s] Auto tutor_chat success", trace_id)
-                else:
-                    logger.warning(
-                        "[%s] Auto tutor_chat returned no content: %s",
-                        trace_id,
-                        tutor_result.get("error", "empty response"),
-                    )
-            except Exception as e:
-                logger.warning("[%s] Auto tutor_chat failed: %s", trace_id, e)
+        if _ocr_content:
+            # Fire-and-forget: tutor_chat runs in background so OCR response
+            # returns to the WeChat gateway immediately.  Teaching content is
+            # delivered asynchronously via notification file.
+            asyncio.create_task(_async_tutor_teach(
+                content=_ocr_content,
+                learner_id=learner_id,
+                trace_id=trace_id,
+            ))
 
     return result
 
@@ -3140,7 +3126,7 @@ _TEACHER_SOUL = """# Soul
 
 ### [PHASE:FIRST_QUESTION] — 首次出题
 
-你的角色：只展示题目，用一个引导问题引发思考。
+你的角色：只展示一道题目，用一个引导问题引发思考。
 
 格式：
 ```
@@ -3154,6 +3140,8 @@ _TEACHER_SOUL = """# Soul
 ```
 
 规则：
+- 🔴 **一次只出一题，选试卷中编号最小的未做题**
+- 🔴 **禁止一次涉及多题** — 即使两道题紧邻也得分两次出
 - 只输出题目 + 一个引导问题
 - ❌ 禁止任何答案提示、分析、概念讲解、选项比较
 - ❌ 禁止"答对了/答错了"等判断
@@ -3182,7 +3170,8 @@ _TEACHER_SOUL = """# Soul
 
 规则：
 - ✅ 必须给出正确答案和简要讲解
-- ✅ 有下一题则自动出题（两步合一）
+- ✅ 有下一题则自动出题（两步合一）— **但只出一题，禁止一次出多题**
+- 🔴 **下一题只能出一道**，不要提前展示第N+2题
 - ❌ 不要等"下一题"指令
 - ❌ 禁止表格分析
 
@@ -4040,12 +4029,27 @@ async def _tutor_chat_core(
 
     # 3. Determine phase and build payload with phase marker.
     #    Phase marker tells LLM which mode to use (see _TEACHER_SOUL).
+    #    硬性规则直接嵌入 message，不依赖 SOUL.md（DT Bot 可能不严格执行 SOUL.md）
     if context.strip() and not message.strip():
         _phase = "FIRST_QUESTION"
-        payload = f"[PHASE:{_phase}]\n{context}"
+        _constraint = (
+            "\n\n【硬性规则】\n"
+            "🔴 本次回复只能出一道题！从试卷中选编号最小的未做题输出。\n"
+            "🔴 绝对禁止在一条回复中出现两道或以上的题目。\n"
+            "🔴 即使两道题紧邻，也必须分两次输出。\n"
+            "✅ 只输出题目 + 一个引导问题，禁止答案提示。\n"
+        )
+        payload = f"[PHASE:{_phase}]{_constraint}\n{context}"
     else:
         _phase = "EVALUATE_ANSWER"
-        payload = f"[PHASE:{_phase}]\n" + (message or context or "")
+        _constraint = (
+            "\n\n【硬性规则】\n"
+            "🔴 评判当前题目后，只能出一道下一题。\n"
+            "🔴 绝对禁止在一条回复中出现两道或以上的题目。\n"
+            "🔴 不要提前展示第N+2题。\n"
+            "✅ 只输出一道题 + 讲解 + 一个引导问题。\n"
+        )
+        payload = f"[PHASE:{_phase}]{_constraint}\n" + (message or context or "")
         # Attach exam context so the LLM picks the next question from the
         # same paper rather than generating from its own knowledge.
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
@@ -4286,6 +4290,21 @@ async def _tutor_chat_core(
                 pass
 
         if mode == "guide":
+            # P0: 程序化强制 — DT Bot 有时一次输出多题，
+            # 截断只保留第一题。截掉的部分在下一次 EVALUATE_ANSWER 时
+            # 会被 DT Bot 自然选中（exam context 全程在 system prompt 中，
+            # 截断后 conversation history 没那道题，DT Bot 不会跳过）。
+            _q_markers = [
+                m.start() for m in re.finditer(r'【第\d+题】|(?<=\n)第\d+题[：:]', content)
+            ]
+            if len(_q_markers) >= 2:
+                content = content[:_q_markers[1]].rstrip()
+                logger.warning(
+                    "[%s] Multi-question DT response truncated "
+                    "(found %d markers, kept first only)",
+                    trace_id, len(_q_markers),
+                )
+
             # P1: strip analysis leakage before polish
             content = _strip_analysis(content, _phase)
             content = _polish_guide_response(content)
@@ -4322,7 +4341,7 @@ async def _tutor_chat_core(
                     _ans = _extract_correct_answer(content)
                     if _ans:
                         _answer_to_inject = _ans
-        result["content"] = content
+        result["content"] = html.unescape(content)
         # Extract and store question text for the next turn's mastery recording.
         _q = _extract_question_text(content)
         if _q:
@@ -4348,16 +4367,27 @@ async def api_llm_acquire(request: Request):
     """Acquire the local LLM lock (blocks until available or timeout).
 
     Query params:
-      - timeout: max wait in seconds (default 300, 0 = no wait)
+      - timeout: max wait in seconds (default 60, 0 = no wait)
     Returns 200 on success, 409 on timeout.
+
+    Stale recovery: if the previous holder failed to release (HTTP release
+    silently dropped), the lock auto-recovers via TTL check below.
     """
     params = request.query_params
-    timeout = float(params.get("timeout", "300"))
+    timeout = float(params.get("timeout", "60"))
+
+    # If lock is stale (held > TTL without release), force-release it.
+    # This prevents a single failed HTTP release from blocking all subsequent
+    # requests for minutes.
+    if _llm_lock.is_stale():
+        logger.warning("[llm_lock] Stale lock detected (held > %.0fs), force-releasing", _llm_lock._ttl)
+        _llm_lock.force_release()
+
     try:
         if timeout <= 0:
             await _llm_lock.acquire()
         else:
-            await asyncio.wait_for(_llm_lock.acquire(), timeout=min(timeout, 300.0))
+            await asyncio.wait_for(_llm_lock.acquire(), timeout=min(timeout, 60.0))
         return {"ok": True, "acquired": True}
     except asyncio.TimeoutError:
         return Response(

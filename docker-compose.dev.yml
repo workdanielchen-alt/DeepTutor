@@ -165,7 +165,7 @@ services:
     volumes:
       - ./data_dev/hermes:/opt/data:rw
       - ./data_dev/hermes_child:/opt/data/child:rw
-      - ./data_dev/hermes:/data/hermes:ro
+      - ./data/hermes:/data/hermes
       - ./config/hermes_config.yaml:/opt/data/config.yaml:ro
       - ./config/hermes_child_config.yaml:/opt/data/child/config.yaml:ro
       - ./vendor/hermes-agent/run_agent.py:/opt/hermes/run_agent.py:ro
@@ -240,8 +240,8 @@ services:
       - ./data/ingest_status:/data/ingest_status
       - ./data/uploads:/data/uploads
       - ./data/sources:/data/sources
-      # 共享 hermes_agent 数据卷 (路径翻译: /opt/data/ → /data/hermes/)
-      - ./data_dev/hermes:/data/hermes
+      # 共享通知目录: platform 写通知 → hermes_agent 消费后推送微信
+      - ./data/hermes:/data/hermes
       - ./data_dev/hermes_child:/data/hermes_child
       # Docker socket: allow exec into hermes_agent for QR login operations
       - /var/run/docker.sock:/var/run/docker.sock:ro
