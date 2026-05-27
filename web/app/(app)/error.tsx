@@ -3,27 +3,27 @@
 import { useEffect, useState } from "react";
 
 /**
- * Catches React 19 concurrent-mode commitPlacement errors (NotFoundError:
- * insertBefore) that occur during route transitions between sibling pages
- * in the (utility) group.  Instead of showing an error screen we
- * auto-recover via reset() — the user sees a brief blank state while
- * React remounts the tree.
+ * Catches React 19 DOM reconciliation errors (NotFoundError: insertBefore /
+ * removeChild) that occur during route transitions.  Instead of showing an
+ * error screen we auto-recover via reset() — the user sees a brief blank
+ * state while React remounts the tree.
  */
-function isInsertBeforeError(error: Error) {
+function isReconciliationError(error: Error) {
   return (
     error.name === "NotFoundError" &&
-    error.message.includes("insertBefore")
+    (error.message.includes("insertBefore") ||
+      error.message.includes("removeChild"))
   );
 }
 
-interface UtilityErrorProps {
+interface AppErrorProps {
   error: Error & { digest?: string };
   reset: () => void;
 }
 
-export default function UtilityError({ error, reset }: UtilityErrorProps) {
+export default function AppError({ error, reset }: AppErrorProps) {
   const [recovering, setRecovering] = useState(false);
-  const silent = isInsertBeforeError(error);
+  const silent = isReconciliationError(error);
 
   useEffect(() => {
     if (silent && !recovering) {
@@ -34,7 +34,7 @@ export default function UtilityError({ error, reset }: UtilityErrorProps) {
     }
   }, [silent, recovering, reset]);
 
-  // insertBefore errors: show nothing while recovering
+  // React 19 reconciliation errors: show nothing while recovering
   if (silent) return null;
 
   // All other errors: show actionable UI
