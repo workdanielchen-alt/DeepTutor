@@ -54,6 +54,15 @@ export async function withClientCache<T>(
   return promise;
 }
 
+/** Synchronously read cached data if available (even if expired). Returns
+ *  `undefined` when there is no cached entry at all, so callers can decide
+ *  whether the stale data is acceptable for their use case. */
+export function readClientCache<T>(key: string): T | undefined {
+  if (typeof window === "undefined") return undefined;
+  const cached = clientCache.get(key) as CacheEntry<T> | undefined;
+  return cached?.data;
+}
+
 export function invalidateClientCache(prefix: string): void {
   for (const key of clientCache.keys()) {
     if (key.startsWith(prefix)) {

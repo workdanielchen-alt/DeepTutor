@@ -49,7 +49,7 @@ export default function QuestionBankSection() {
   const { t } = useTranslation();
   const [items, setItems] = useState<NotebookEntry[]>([]);
   const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterMode>("all");
   const [activeCategoryId, setActiveCategoryId] = useState<number | null>(null);
@@ -73,6 +73,7 @@ export default function QuestionBankSection() {
   const loadItems = useCallback(
     async (mode: FilterMode, catId: number | null) => {
       setErrorMsg(null);
+      const timer = setTimeout(() => setLoading(true), 300);
       try {
         const response = await listNotebookEntries({
           bookmarked: mode === "bookmarked" ? true : undefined,
@@ -85,6 +86,7 @@ export default function QuestionBankSection() {
       } catch (err) {
         setErrorMsg(String(err instanceof Error ? err.message : err));
       } finally {
+        clearTimeout(timer);
         setLoading(false);
       }
     },

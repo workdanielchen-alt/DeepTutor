@@ -19,6 +19,7 @@ import {
   updateSessionTitle,
   type SessionSummary,
 } from "@/lib/session-api";
+import { readClientCache } from "@/lib/client-cache";
 
 /**
  * Sessions list for chat history. Reopened sessions always route back to
@@ -39,21 +40,37 @@ export default function ChatHistorySection({
   const { t } = useTranslation();
   const router = useRouter();
   const { activeSessionId, setActiveSessionId } = useAppShell();
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [sessions, setSessions] = useState<SessionSummary[]>(
+    // Show previously cached data immediately — no empty flash on return
+    // visits. The background refresh below updates it seamlessly.
+    () => readClientCache<SessionSummary[]>("sessions:200:0") ?? [],
+  );
+  const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState("");
 
-  const load = useCallback(async (force = false) => {
-    setLoading(true);
-    try {
-      setSessions(await listSessions(200, 0, { force }));
-    } finally {
-      setLoading(false);
+  const load = useCallback(async (force = false, showLoading = true) => {
+    // When loading from background (showLoading=false), never show skeleton.
+    // Only show loading state on explicit user actions (Refresh button).
+    if (showLoading) {
+      const timer = setTimeout(() => setLoading(true), 300);
+      try {
+        setSessions(await listSessions(200, 0, { force }));
+      } finally {
+        clearTimeout(timer);
+        setLoading(false);
+      }
+    } else {
+      try {
+        setSessions(await listSessions(200, 0, { force }));
+      } catch {
+        /* silent background refresh — stale data is better than a flash */
+      }
     }
   }, []);
 
   useEffect(() => {
-    void load(true);
+    // Background refresh: no loading indicator, uses client cache for speed.
+    void load(false, false);
   }, [load]);
 
   const filteredSessions = useMemo(() => {

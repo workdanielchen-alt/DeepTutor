@@ -61,7 +61,7 @@ export default function NotebooksSection() {
   const router = useRouter();
 
   const [notebooks, setNotebooks] = useState<NotebookInfo[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [newName, setNewName] = useState("");
   const [newDescription, setNewDescription] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -107,7 +107,7 @@ export default function NotebooksSection() {
   );
 
   const load = useCallback(async () => {
-    setLoading(true);
+    const timer = setTimeout(() => setLoading(true), 300);
     try {
       const nbs = await listNotebooks();
       const next: NotebookInfo[] = nbs.map((nb) => ({
@@ -129,6 +129,7 @@ export default function NotebooksSection() {
         setSelected(null);
       }
     } finally {
+      clearTimeout(timer);
       setLoading(false);
     }
   }, [loadDetail, selectedId]);

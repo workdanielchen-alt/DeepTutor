@@ -66,8 +66,8 @@ export default function SkillsSection() {
   const [editorTagDraft, setEditorTagDraft] = useState("");
 
   const load = useCallback(async () => {
-    setLoading(true);
     setErrorMsg(null);
+    const timer = setTimeout(() => setLoading(true), 300);
     try {
       const [items, tags] = await Promise.all([
         listSkills({ force: true }),
@@ -78,6 +78,7 @@ export default function SkillsSection() {
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
+      clearTimeout(timer);
       setLoading(false);
     }
   }, []);
